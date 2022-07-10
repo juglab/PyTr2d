@@ -2,7 +2,7 @@ from dataio import projectio
 from viz import napariviz
 from tracking import trackingsolver
 
-project_folder = './data/pytr2d_projects/NewEasy_July16_MINI'
+project_folder = './data/pytr2d_projects/Fluo-N2DL-HeLa'
 
 raw = projectio.load_raw(project_folder)
 instances = projectio.load_instances(project_folder)
