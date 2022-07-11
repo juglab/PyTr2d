@@ -1,3 +1,7 @@
+# our own ignor stuff
+data/
+.idea/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
