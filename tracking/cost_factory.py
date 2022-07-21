@@ -25,6 +25,11 @@ class cost_factory:
             1,          # lambda (global scaling of this cost)
             1,          # w_dist: factor for distance in pixels
             1,          # w_size: factor for difference in size
+        ],
+        'division': [
+            1,  # lambda (global scaling of this cost)
+            1,  # w_dist: factor for distance in pixels
+            1,  # w_size: factor for difference in size
         ]
     }
 
@@ -32,8 +37,9 @@ class cost_factory:
         '''
         Constructor: if filename to parameters_yaml_file is not given, default values will be used
         '''
-        if parameters_yaml_file != None:
-            self.load_parameters(parameters_yaml_file)
+        if parameters_yaml_file is None:
+            return
+        self.load_parameters(parameters_yaml_file)
 
     def save_parameters(self, filename):
         '''
