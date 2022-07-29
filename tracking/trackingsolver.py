@@ -1,10 +1,14 @@
 import gurobipy as gp
 from gurobipy import quicksum
 from gurobipy import GRB
+from matplotlib import pyplot as plt
 from scipy.spatial import distance
 from itertools import combinations
+
+from skimage.measure import regionprops
 from tqdm import tqdm
 from scipy.spatial import KDTree
+import numpy as np
 
 # Gurobi model
 tracking_model = gp.Model('Tracking')
@@ -25,24 +29,27 @@ segments = {
 segmentation = {}
 tracking = {}
 costs = {}
-
+timepoints = []
 def get_key_from_value(d, val):
     keys = [k for k, v in d.items() if v == val]
     if keys:
         return keys[0]
     return None
-def ilp(timepoints):
+def ilp(frames):
 
-    add_variables(timepoints)
+    global timepoints
+    timepoints = frames
+    add_variables()
     tracking_model.update()
-    add_constraints(timepoints)
+    add_constraints()
     set_objective()
     tracking_model.optimize()
-    tracklets = show_result(timepoints)
+    tracklets = show_result()
     return tracklets
 
-def add_variables(timepoints):
+def add_variables():
 
+    global timepoints
     for sframe in tqdm(range(len(timepoints) - 1), desc="adding variables to the model"):
 
         for cell_id in timepoints[sframe]['cell_ids']:
@@ -94,8 +101,9 @@ def add_variables(timepoints):
             tracking[-1, eframe, -1, -1, cell_id] = tracking_model.addVar(vtype=GRB.BINARY, name="app")
             costs[eframe, cell_id, action['appearance']] = int(timepoints[eframe]['areas'][cell_id]) + 400
 
-def add_constraints(timepoints):
+def add_constraints():
 
+    global timepoints
     for sframe in tqdm(range(len(timepoints) - 1), desc="adding constraints to the model"):
 
         eframe = sframe + 1
@@ -148,9 +156,10 @@ def get_neighborhood(timepoints, sframe, cell_id):
 
     return neighborhood[cell_id]
 
-def show_result(timepoints):
+def show_result():
 
-    number_of_ids = -1
+    global timepoints
+    number_of_ids = 0
     tracklets = []
     for t in range(len(timepoints) - 1):
         if t == 0 :
@@ -158,6 +167,8 @@ def show_result(timepoints):
                 cell_id = timepoints[t]['centroids'].index(dot)
                 if segmentation[t,cell_id].x == 1:
                     number_of_ids += 1
+                    timepoints[t]['cell_ids'][cell_id] = number_of_ids
+
                     tracklets.insert(0,[number_of_ids,t,dot[0],dot[1]])
 
         for (a,b,c,d,e) in tracking:
@@ -179,9 +190,49 @@ def show_result(timepoints):
                         tracklets.insert(0, [number_of_ids, b, dot[0], dot[1]])
         for dot in timepoints[t]['centroids']:
             cell_id = timepoints[t]['centroids'].index(dot)
-            if segmentation[t, cell_id].x == 1 and (cell_id not in range(number_of_ids+1)):
+            if segmentation[t, cell_id].x == 1 and (cell_id not in range(1,number_of_ids+1)):
                 number_of_ids += 1
                 tracklets.insert(0, [number_of_ids, t, dot[0], dot[1]])
 
+    #changing the labels
+    #for t in range(len(timepoints)):
+        #print(len(timepoints[t]['cell_ids']),timepoints[t]['cell_ids'])
+    #_, axs = plt.subplots(1, 2)
+
+    #axs[0].imshow(timepoints[4]['labels'], cmap='hot')
+
+    for t in range(len(timepoints)):
+        RP = regionprops(timepoints[t]['labels'])
+        for index in range(len(RP)):
+            for (i,j) in RP[index].coords:
+                timepoints[t]['labels'][i][j] = timepoints[t]['cell_ids'][index]
+
+    #axs[1].imshow(timepoints[4]['labels'],cmap='hot')
+    #plt.show()
+
     tracklets.sort(key=lambda x: (x[0], x[1]))
     return tracklets
+
+def returnCost(event):
+
+    global timepoints
+
+    frame = int(event.position[0])
+    x = int(event.position[1])
+    y = int(event.position[2])
+
+    id = timepoints[frame]["labels"][x][y]
+    ind = timepoints[frame]['cell_ids'].index(id)
+
+    out = str(id)
+
+    return out
+
+def getInstance():
+
+    global timepoints
+    instances = np.zeros((len(timepoints), len(timepoints[0]["labels"]), len(timepoints[0]["labels"][0])),dtype=int)
+
+    for t in range(len(timepoints)):
+        instances[t] = timepoints[t]["labels"]
+    return instances
