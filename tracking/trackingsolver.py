@@ -93,7 +93,7 @@ def add_variables():
                         timepoints[eframe]['centroids'][n1], timepoints[eframe]['centroids'][n2]))
 
             # disappearing
-            tracking[sframe, -1, cell_id, -1, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="diss")
+            tracking[sframe, -1, cell_id, -1, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="disa")
             costs[sframe, cell_id, action['disappearance']] = 510
 
         for cell_id in timepoints[eframe]['cell_ids']:
@@ -159,17 +159,21 @@ def get_neighborhood(timepoints, sframe, cell_id):
 def show_result():
 
     global timepoints
-    number_of_ids = 0
+
+    #changing the ids and generating tracklets
+    new_id = 0
     tracklets = []
     for t in range(len(timepoints) - 1):
-        if t == 0 :
+        #first time point
+        if t == 0:
             for dot in timepoints[t]['centroids']:
                 cell_id = timepoints[t]['centroids'].index(dot)
                 if segmentation[t,cell_id].x == 1:
-                    number_of_ids += 1
-                    timepoints[t]['cell_ids'][cell_id] = number_of_ids
-
-                    tracklets.insert(0,[number_of_ids,t,dot[0],dot[1]])
+                    new_id += 1
+                    timepoints[t]['cell_ids'][cell_id] = new_id
+                    tracklets.insert(0,[new_id,t,dot[0],dot[1]])
+                else:
+                   timepoints[t]['cell_ids'][cell_id] = 0
 
         for (a,b,c,d,e) in tracking:
             if a == t and b == t+1:
@@ -180,21 +184,28 @@ def show_result():
                         timepoints[b]['cell_ids'][d] = timepoints[a]['cell_ids'][c]
                         tracklets.insert(0, [timepoints[a]['cell_ids'][c], b, dot[0], dot[1]])
                     if e != -1 and d != -1:
-                        dot = timepoints[b]['centroids'][d]
-                        number_of_ids += 1
-                        timepoints[b]['cell_ids'][d] = number_of_ids
-                        tracklets.insert(0, [number_of_ids, b, dot[0], dot[1]])
-                        dot = timepoints[b]['centroids'][e]
-                        number_of_ids += 1
-                        timepoints[b]['cell_ids'][e] = number_of_ids
-                        tracklets.insert(0, [number_of_ids, b, dot[0], dot[1]])
-        for dot in timepoints[t]['centroids']:
-            cell_id = timepoints[t]['centroids'].index(dot)
-            if segmentation[t, cell_id].x == 1 and (cell_id not in range(1,number_of_ids+1)):
-                number_of_ids += 1
-                tracklets.insert(0, [number_of_ids, t, dot[0], dot[1]])
+                        mother = timepoints[a]['centroids'][c]
+                        daughter1 = timepoints[b]['centroids'][d]
+                        new_id += 1
+                        timepoints[b]['cell_ids'][d] = new_id
+                        tracklets.insert(0, [new_id, a, mother[0], mother[1]])
+                        tracklets.insert(0, [new_id, b, daughter1[0], daughter1[1]])
+                        daughter2 = timepoints[b]['centroids'][e]
+                        new_id += 1
+                        timepoints[b]['cell_ids'][e] = new_id
+                        tracklets.insert(0, [new_id, a, mother[0], mother[1]])
+                        tracklets.insert(0, [new_id, b, daughter2[0], daughter2[1]])
+
+        if t!=0:
+            for dot in timepoints[t]['centroids']:
+                cell_id = timepoints[t]['centroids'].index(dot)
+                if tracking[-1,t, -1,-1,cell_id].x == 1:
+                    new_id += 1
+                    timepoints[t]['cell_ids'][cell_id] = new_id
+                    tracklets.insert(0, [new_id, t, dot[0], dot[1]])
 
     #changing the labels
+
     #for t in range(len(timepoints)):
         #print(len(timepoints[t]['cell_ids']),timepoints[t]['cell_ids'])
     #_, axs = plt.subplots(1, 2)
@@ -246,7 +257,7 @@ def returnCost(event):
                 out = out + " is "
                 out = out + str(value)
                 if tracking[frame, frame+1, ind, key[3],-1].x == 1:
-                    out = out + " ---> Moved"
+                    out = out + " ---> Will move"
                 out = out + "\n"
 
     out = out + "\nDivision Cost:\nto cell with IDs:\n"
@@ -260,23 +271,23 @@ def returnCost(event):
                 out = out + " is "
                 out = out + str(value)
                 if tracking[frame, frame+1, ind, key[3], key[4]].x == 1:
-                    out = out + " ---> Divided"
+                    out = out + " ---> Will divide"
                 out = out + "\n"
+
+    if frame >=0 and frame < len(timepoints)-1:
+        out = out + "\nDisappearing Cost is: "
+        disappearing_cost = str(costs[frame, ind, action['disappearance']])
+        out = out + str(disappearing_cost)
+        if tracking[frame, -1, ind, -1, -1].x == 1:
+            out = out + " ---> Will disappear"
+        out = out + "\n"
 
     if frame >=1 and frame < len(timepoints):
         out = out + "\nAppearing Cost is: "
         appearing_cost = str(costs[frame, ind, action['appearance']])
         out = out + str(appearing_cost)
-        if tracking[frame, -1, ind, -1, -1].x == 1:
+        if tracking[-1, frame, -1, -1, ind].x == 1:
             out = out + " ---> Appeared"
-        out = out + "\n"
-
-    if frame >=0 and frame < len(timepoints)-1:
-        out = out + "\nDisappearing Cost is: "
-        disappearing_cost = str(costs[frame+1, ind, action['disappearance']])
-        out = out + str(disappearing_cost)
-        if tracking[-1, frame + 1, -1, -1, ind].x == 1:
-            out = out + " ---> Disappeared"
         out = out + "\n"
 
     return out

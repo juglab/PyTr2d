@@ -16,8 +16,8 @@ def runTracking(project_folder):
     instances = projectio.load_instances(project_folder)
     timepoints = projectio.load_features(instances)
     tracklets = trackingsolver.ilp(timepoints)  # <-- Sheida: NICE! ;)
-    #napariviz.show_tracking(raw, instances, tracklets)
     instances =projectio.load_updated_instances()
+    #napariviz.show_tracking(raw, instances, tracklets)
     return raw,instances,tracklets
 
 if __name__ == "__main__":
