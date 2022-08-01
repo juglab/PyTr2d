@@ -22,7 +22,7 @@ def runTracking(project_folder):
 
 if __name__ == "__main__":
     parse = argparse.ArgumentParser()
-    parse.add_argument('--proj_folder', default='./data/pytr2d_projects/Fluo-N2DL-HeLa')
+    parse.add_argument('--proj_folder', default='./data/pytr2d_projects/NewEasy_July16_MINI')
     args = parse.parse_args()
     runTracking(args.proj_folder)
 

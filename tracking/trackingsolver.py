@@ -71,7 +71,7 @@ def add_variables():
             if len(neighborhood) > 0:
                 for n in neighborhood:
                     tracking[sframe, eframe, cell_id, n, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="move")
-                    costs[sframe, cell_id, action['move'],n] = int(abs(
+                    costs[sframe, cell_id, action['move'],n] = int(abs(0.5*
                         timepoints[sframe]['areas'][cell_id] - timepoints[eframe]['areas'][n]) + distance.euclidean(
                         timepoints[sframe]['centroids'][cell_id], timepoints[eframe]['centroids'][n]))
 
@@ -83,7 +83,7 @@ def add_variables():
                     n1 = i[0]
                     n2 = i[1]
                     tracking[sframe, eframe, cell_id, n1, n2] = tracking_model.addVar(vtype=GRB.BINARY, name="division")
-                    costs[sframe, cell_id, action['division'],n1,n2] = int(abs(
+                    costs[sframe, cell_id, action['division'],n1,n2] = int(abs(0.5*
                         timepoints[sframe]['areas'][cell_id] - timepoints[eframe]['areas'][n1] -
                         timepoints[eframe]['areas'][n2]) + (distance.euclidean(
                         timepoints[sframe]['centroids'][cell_id],
@@ -92,7 +92,7 @@ def add_variables():
                         timepoints[eframe]['centroids'][n2])) / 2 - distance.euclidean(
                         timepoints[eframe]['centroids'][n1], timepoints[eframe]['centroids'][n2]))
 
-            # dissapearing
+            # disappearing
             tracking[sframe, -1, cell_id, -1, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="diss")
             costs[sframe, cell_id, action['disappearance']] = 510
 
@@ -224,7 +224,60 @@ def returnCost(event):
     id = timepoints[frame]["labels"][x][y]
     ind = timepoints[frame]['cell_ids'].index(id)
 
-    out = str(id)
+    out = ""
+
+    out = out + "Cost Function for cell with ID " +str(id)+ "\n\nSegmentation Cost: "
+
+    segmentation_cost = str(costs[frame,ind,action['segmented']])
+
+    out = out + segmentation_cost\
+
+    if segmentation[frame, ind].x == 1:
+        out = out + " ---> Segmented"
+
+    out = out + "\n"
+
+    out = out + "\nMoving Cost:\nto cell with ID:\n"
+
+    for key,value in costs.items():
+        if len(key) == 4:
+            if key[0] == frame and key[1] == ind and key[2] == action['move']:
+                out = out + str(timepoints[frame+1]['cell_ids'][key[3]])
+                out = out + " is "
+                out = out + str(value)
+                if tracking[frame, frame+1, ind, key[3],-1].x == 1:
+                    out = out + " ---> Moved"
+                out = out + "\n"
+
+    out = out + "\nDivision Cost:\nto cell with IDs:\n"
+
+    for key, value in costs.items():
+        if len(key) == 5:
+            if key[0] == frame and key[1] == ind and key[2] == action['division']:
+                out = out + str(timepoints[frame + 1]['cell_ids'][key[3]])
+                out = out + " and "
+                out = out + str(timepoints[frame + 1]['cell_ids'][key[4]])
+                out = out + " is "
+                out = out + str(value)
+                if tracking[frame, frame+1, ind, key[3], key[4]].x == 1:
+                    out = out + " ---> Divided"
+                out = out + "\n"
+
+    if frame >=1 and frame < len(timepoints):
+        out = out + "\nAppearing Cost is: "
+        appearing_cost = str(costs[frame, ind, action['appearance']])
+        out = out + str(appearing_cost)
+        if tracking[frame, -1, ind, -1, -1].x == 1:
+            out = out + " ---> Appeared"
+        out = out + "\n"
+
+    if frame >=0 and frame < len(timepoints)-1:
+        out = out + "\nDisappearing Cost is: "
+        disappearing_cost = str(costs[frame+1, ind, action['disappearance']])
+        out = out + str(disappearing_cost)
+        if tracking[-1, frame + 1, -1, -1, ind].x == 1:
+            out = out + " ---> Disappeared"
+        out = out + "\n"
 
     return out
 
