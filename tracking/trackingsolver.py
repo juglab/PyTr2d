@@ -108,31 +108,16 @@ def add_constraints():
 
         eframe = sframe + 1
         for cell_id in timepoints[sframe]['cell_ids']:
-            # a cell in each timeframe can either move, divide or disappear (zero whe it's not segmented) so == 1
+            # a cell in each timeframe can either move, divide or disappear (zero whe it's not segmented)
             tracking_model.addConstr(
-                quicksum(tracking[a, b, c, d, e] for (a, b, c, d, e) in tracking if a == sframe and c == cell_id) == 1)
-            for (a, b, c, d, e) in tracking:
-                if a == sframe and c == cell_id:
-                    # if it's move/divide/disappeare then it has to be segmented
-                    tracking_model.addConstr(tracking[a, b, c, d, e] <= segmentation[a, cell_id])
-                    # if d == -1 and e == -1:
-                    #     tracking_model.addConstr(tracking[a,b,c,d,e] * segmentation[b,c] == 0)
-                    if d != -1:
-                        # when it move(moved cell in next timeframe)/divide(first kid) should be segmented
-                        tracking_model.addConstr(tracking[a, b, c, d, e] <= segmentation[eframe, d])
-                        if e != -1:
-                            # for division the second kid also needs to be segmented
-                            tracking_model.addConstr(tracking[a, b, c, d, e] <= segmentation[eframe, e])
+                quicksum(tracking[a, b, c, d, e] for (a, b, c, d, e) in tracking if a == sframe and c == cell_id) == segmentation[sframe,cell_id])
 
         for cell_id in timepoints[eframe]['cell_ids']:
-            # a cell in each timepoint can either be a daughter of a cell/moved/appeared
+            # a cell in each timepoint can either be a daughter of a cell/moved/appeared (zero whe it's not segmented)
             tracking_model.addConstr(
                 quicksum(tracking[a, b, c, d, e] for (a, b, c, d, e) in tracking if
-                         b == eframe and (d == cell_id or e == cell_id)) == 1)
-            for (a, b, c, d, e) in tracking:
-                if b == eframe and a == -1 and e == cell_id:
-                    # for appearance it has to be segmented first
-                    tracking_model.addConstr(tracking[a, b, c, d, e] <= segmentation[eframe, cell_id])
+                         b == eframe and (d == cell_id or e == cell_id)) == segmentation[eframe,cell_id])
+
 
 def set_objective():
 
@@ -176,7 +161,8 @@ def show_result():
                     timepoints[t]['cell_ids'][cell_id] = new_id
                     tracklets.insert(0,[new_id,t,dot[0],dot[1]])
                 else:
-                   timepoints[t]['cell_ids'][cell_id] = 0
+                    print("NOT SEGMENTED")
+                    timepoints[t]['cell_ids'][cell_id] = 0
 
         for (a,b,c,d,e) in tracking:
             if a == t and b == t+1:
