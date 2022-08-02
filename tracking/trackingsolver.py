@@ -108,13 +108,15 @@ def add_constraints():
 
         eframe = sframe + 1
         for cell_id in timepoints[sframe]['cell_ids']:
-            # a cell in each timeframe can either move, divide or disappear (zero whe it's not segmented) so <= 1
+            # a cell in each timeframe can either move, divide or disappear (zero whe it's not segmented) so == 1
             tracking_model.addConstr(
                 quicksum(tracking[a, b, c, d, e] for (a, b, c, d, e) in tracking if a == sframe and c == cell_id) == 1)
             for (a, b, c, d, e) in tracking:
                 if a == sframe and c == cell_id:
                     # if it's move/divide/disappeare then it has to be segmented
                     tracking_model.addConstr(tracking[a, b, c, d, e] <= segmentation[a, cell_id])
+                    # if d == -1 and e == -1:
+                    #     tracking_model.addConstr(tracking[a,b,c,d,e] * segmentation[b,c] == 0)
                     if d != -1:
                         # when it move(moved cell in next timeframe)/divide(first kid) should be segmented
                         tracking_model.addConstr(tracking[a, b, c, d, e] <= segmentation[eframe, d])
@@ -164,6 +166,7 @@ def show_result():
     new_id = 0
     tracklets = []
     for t in range(len(timepoints) - 1):
+        t_plus = t+1
         #first time point
         if t == 0:
             for dot in timepoints[t]['centroids']:
@@ -196,13 +199,12 @@ def show_result():
                         tracklets.insert(0, [new_id, a, mother[0], mother[1]])
                         tracklets.insert(0, [new_id, b, daughter2[0], daughter2[1]])
 
-        if t!=0:
-            for dot in timepoints[t]['centroids']:
-                cell_id = timepoints[t]['centroids'].index(dot)
-                if tracking[-1,t, -1,-1,cell_id].x == 1:
-                    new_id += 1
-                    timepoints[t]['cell_ids'][cell_id] = new_id
-                    tracklets.insert(0, [new_id, t, dot[0], dot[1]])
+        for dot in timepoints[t_plus]['centroids']:
+            cell_id = timepoints[t_plus]['centroids'].index(dot)
+            if tracking[-1,t_plus, -1,-1,cell_id].x == 1:
+                new_id += 1
+                timepoints[t_plus]['cell_ids'][cell_id] = new_id
+                tracklets.insert(0, [new_id, t_plus, dot[0], dot[1]])
 
     #changing the labels
 
