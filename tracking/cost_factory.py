@@ -1,5 +1,6 @@
 import yaml
 import io
+from scipy.spatial import distance
 
 class cost_factory:
     '''
@@ -9,6 +10,11 @@ class cost_factory:
     '''
 
     parameters = {
+        'segmentation': [
+            1,          # lambda (global scaling of this cost)
+            1,          # w_size: factor for difference in size
+            300,        # bias
+        ],
         'appearance': [
             1,          # lambda (global scaling of this cost)
             0,          # min cost
@@ -24,12 +30,12 @@ class cost_factory:
         'movement': [
             1,          # lambda (global scaling of this cost)
             1,          # w_dist: factor for distance in pixels
-            1,          # w_size: factor for difference in size
+            0.5,        # w_size: factor for difference in size
         ],
         'division': [
-            1,  # lambda (global scaling of this cost)
-            1,  # w_dist: factor for distance in pixels
-            1,  # w_size: factor for difference in size
+            1,          # lambda (global scaling of this cost)
+            1,          # w_dist: factor for distance in pixels
+            1,          # w_size: factor for difference in size
         ]
     }
 
@@ -62,17 +68,17 @@ class cost_factory:
 
 
 
-    def get_segmentation_cost(self,stuff,you,need):
+    def get_segmentation_cost(self,size):
         '''
         Explain what the f it does... and why it is negative... ;)
-        :param stuff: what
+        :param size: size of the cell
         :param you: is
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return 0.0
+        return -self.parameters['segmentation'][0]*self.parameters['segmentation'][0]*size
 
-    def get_appearance_cost(self,stuff,you,need):
+    def get_appearance_cost(self,size):
         '''
         Explain what the f it does...
         :param stuff: what
@@ -80,9 +86,9 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return 0.0
+        return int(size) + 400
 
-    def get_disappearance_cost(self,stuff,you,need):
+    def get_disappearance_cost(self):
         '''
         Explain what the f it does...
         :param stuff: what
@@ -90,9 +96,9 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return 0.0
+        return 500
 
-    def get_movement_cost(self,stuff,you,need):
+    def get_movement_cost(self,size1,centroid1,size2,centroid2):
         '''
         Explain what the f it does...
         :param stuff: what
@@ -100,9 +106,9 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return 0.0
+        return self.parameters['movement'][0] * int( self.parameters['movement'][1] * distance.euclidean(centroid1,centroid2) + self.parameters['movement'][2] * abs(size1-size2))
 
-    def get_division_cost(self,stuff,you,need):
+    def get_division_cost(self,size1,centroid1,size2,centroid2,size3,centroid3):
         '''
         Explain what the f it does...
         :param stuff: what
@@ -110,4 +116,7 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return 0.0
+        return int(abs(0.5 * size1 - size2 - size3) + (
+                    distance.euclidean(centroid1, centroid2) + distance.euclidean(centroid1,
+                                                                                  centroid3)) / 2 - distance.euclidean(
+            centroid2, centroid3))
