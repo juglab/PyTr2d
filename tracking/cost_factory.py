@@ -17,25 +17,25 @@ class cost_factory:
         ],
         'appearance': [
             1,          # lambda (global scaling of this cost)
-            0,          # min cost
-            1,          # slope
-            25,         # max value
+            10,          # min cost
+            13,          # slope
+            400,         # max value
         ],
         'disappearance': [
             1,          # lambda (global scaling of this cost)
-            0,          # min cost
-            1,          # slope
-            15,         # max value
+            50,          # min cost
+            15,          # slope
+            500,         # max value
         ],
         'movement': [
             1,          # lambda (global scaling of this cost)
-            1,          # w_dist: factor for distance in pixels
-            0.5,        # w_size: factor for difference in size
+            2,          # w_dist: factor for distance in pixels
+            0.1,        # w_size: factor for difference in size
         ],
         'division': [
-            1,          # lambda (global scaling of this cost)
+            0.5,        # lambda (global scaling of this cost)
             1,          # w_dist: factor for distance in pixels
-            1,          # w_size: factor for difference in size
+            0.1,          # w_size: factor for difference in size
         ]
     }
 
@@ -67,7 +67,6 @@ class cost_factory:
             self.parameters = yaml.safe_load(stream)
 
 
-
     def get_segmentation_cost(self,size):
         '''
         Explain what the f it does... and why it is negative... ;)
@@ -78,7 +77,7 @@ class cost_factory:
         '''
         return -self.parameters['segmentation'][0]*self.parameters['segmentation'][0]*size
 
-    def get_appearance_cost(self,size):
+    def get_appearance_cost(self,centroid,dimention):
         '''
         Explain what the f it does...
         :param stuff: what
@@ -86,9 +85,31 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return int(size) + 400
+        x = centroid[0]
+        y = centroid[1]
+        outer_margin = 25 #Field of interest of the dataset (E)
+        inner_margin = 55
+        lam = self.parameters['appearance'][0]
+        min = self.parameters['appearance'][1]
+        slope = self.parameters['appearance'][2]
+        max = self.parameters['appearance'][3]
 
-    def get_disappearance_cost(self):
+        if x <= outer_margin or x >= dimention[0]-outer_margin:
+            return lam * min
+        elif y <= outer_margin or y >= dimention[1]-outer_margin:
+            return lam * min
+        elif x <= inner_margin:
+            return lam * ( slope * (inner_margin - x) + min)
+        elif x >= dimention[0] - inner_margin:
+            return lam * (slope * (x - dimention[0] + inner_margin) + min)
+        elif y <= inner_margin:
+            return lam * (slope * (inner_margin - y) + min)
+        elif y >= dimention[1] - inner_margin:
+            return lam * (slope * (y - dimention[1] + inner_margin) + min)
+        else:
+            return lam * max
+
+    def get_disappearance_cost(self,centroid,dimention):
         '''
         Explain what the f it does...
         :param stuff: what
@@ -96,7 +117,29 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return 500
+        x = centroid[0]
+        y = centroid[1]
+        outer_margin = 25
+        inner_margin = 55
+        lam = self.parameters['disappearance'][0]
+        min = self.parameters['disappearance'][1]
+        slope = self.parameters['disappearance'][2]
+        max = self.parameters['disappearance'][3]
+
+        if x <= outer_margin or x >= dimention[0] - outer_margin:
+            return lam * min
+        elif y <= outer_margin or y >= dimention[1] - outer_margin:
+            return lam * min
+        elif x <= inner_margin:
+            return lam * (slope * (inner_margin - x) + min)
+        elif x >= dimention[0] - inner_margin:
+            return lam * (slope * (x - dimention[0] + inner_margin) + min)
+        elif y <= inner_margin:
+            return lam * (slope * (inner_margin - y) + min)
+        elif y >= dimention[1] - inner_margin:
+            return lam * (slope * (y - dimention[1] + inner_margin) + min)
+        else:
+            return lam * max
 
     def get_movement_cost(self,size1,centroid1,size2,centroid2):
         '''
@@ -106,7 +149,9 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return self.parameters['movement'][0] * int( self.parameters['movement'][1] * distance.euclidean(centroid1,centroid2) + self.parameters['movement'][2] * abs(size1-size2))
+        return self.parameters['movement'][0] * (
+                    self.parameters['movement'][1] * distance.euclidean(centroid1, centroid2) +
+                    self.parameters['movement'][2] * abs(size1 - size2))
 
     def get_division_cost(self,size1,centroid1,size2,centroid2,size3,centroid3):
         '''
@@ -116,7 +161,7 @@ class cost_factory:
         :param need: this
         :return: returns the costs for an appearance event
         '''
-        return int(abs(0.5 * size1 - size2 - size3) + (
-                    distance.euclidean(centroid1, centroid2) + distance.euclidean(centroid1,
-                                                                                  centroid3)) / 2 - distance.euclidean(
-            centroid2, centroid3))
+        return self.parameters['division'][0] * (abs(self.parameters['division'][1] * ((distance.euclidean(centroid1,
+                                                                                                           centroid2) + distance.euclidean(
+            centroid1, centroid3)) / 2 - distance.euclidean(centroid2, centroid3))) + abs(
+            self.parameters['division'][2] * size1 - (size2 + size3)))

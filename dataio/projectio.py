@@ -11,7 +11,7 @@ def load_instances(project_folder):
     return skio.imread(sorted(glob(project_folder+'/seg/somesource/*.tif')), plugin='tifffile')
 
 def load_updated_instances():
-    return trackingsolver.getInstance()
+    return trackingsolver.get_instance()
 
 def load_features(instances):
 

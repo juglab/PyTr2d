@@ -1,8 +1,6 @@
 import gurobipy as gp
 from gurobipy import quicksum
 from gurobipy import GRB
-from matplotlib import pyplot as plt
-from scipy.spatial import distance
 from itertools import combinations
 from skimage.measure import regionprops
 from tqdm import tqdm
@@ -14,7 +12,6 @@ from tracking.cost_factory import cost_factory
 
 
 tracking_model = gp.Model('Tracking')
-print("Gurobi model is created")
 
 action = {
     'segmented': 0,
@@ -33,6 +30,7 @@ segmentation = {}
 tracking = {}
 costs = {}
 timepoints = []
+coefficients = {}
 
 def get_key_from_value(d, val):
     keys = [k for k, v in d.items() if v == val]
@@ -40,29 +38,29 @@ def get_key_from_value(d, val):
         return keys[0]
     return None
 
-def ilp(frames):
+def ilp(frames,coeff):
 
-    global timepoints
+    global timepoints,coefficients
     timepoints = frames
+    coefficients = coeff
     add_variables()
     tracking_model.update()
     add_constraints()
     set_objective()
     tracking_model.optimize()
     tracklets = show_result()
+    #save_tracking_result()
     return tracklets
 
 def add_variables():
 
     global timepoints
 
-    costFactory = cost_factory()
-
     for sframe in tqdm(range(len(timepoints) - 1), desc="adding variables to the model"):
 
         for cell_id in timepoints[sframe]['cell_ids']:
             segmentation[sframe, cell_id] = tracking_model.addVar(vtype=GRB.BINARY, name="segmentation")
-            costs[sframe, cell_id, action['segmented']] = costFactory.get_segmentation_cost(
+            costs[sframe, cell_id, action['segmented']] = coefficients.get_segmentation_cost(
                 timepoints[sframe]['areas'][cell_id])
 
         eframe = sframe + 1
@@ -70,7 +68,7 @@ def add_variables():
         if eframe == len(timepoints)-1:
             for cell_id in timepoints[eframe]['cell_ids']:
                 segmentation[eframe, cell_id] = tracking_model.addVar(vtype=GRB.BINARY, name="segmentation")
-                costs[eframe, cell_id, action['segmented']] = costFactory.get_segmentation_cost(
+                costs[eframe, cell_id, action['segmented']] = coefficients.get_segmentation_cost(
                     timepoints[eframe]['areas'][cell_id])
 
         for cell_id in timepoints[sframe]['cell_ids']:
@@ -82,7 +80,7 @@ def add_variables():
                 for n in neighborhood:
                     tracking[sframe, eframe, cell_id, n, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="move")
                     # giving the size of cells and their centroids in each time point
-                    costs[sframe, cell_id, action['move'], n] = cost_factory.get_movement_cost(costFactory,
+                    costs[sframe, cell_id, action['move'], n] = cost_factory.get_movement_cost(coefficients,
                         timepoints[sframe]['areas'][cell_id], timepoints[sframe]['centroids'][cell_id],
                         timepoints[eframe]['areas'][n], timepoints[eframe]['centroids'][n])
 
@@ -94,19 +92,23 @@ def add_variables():
                     n1 = i[0]
                     n2 = i[1]
                     tracking[sframe, eframe, cell_id, n1, n2] = tracking_model.addVar(vtype=GRB.BINARY, name="division")
-                    costs[sframe, cell_id, action['division'], n1, n2] = costFactory.get_division_cost(
+                    costs[sframe, cell_id, action['division'], n1, n2] = coefficients.get_division_cost(
                         timepoints[sframe]['areas'][cell_id], timepoints[sframe]['centroids'][cell_id],
                         timepoints[eframe]['areas'][n1], timepoints[eframe]['centroids'][n1],
                         timepoints[eframe]['areas'][n2], timepoints[eframe]['centroids'][n2])
 
             # disappearing
             tracking[sframe, -1, cell_id, -1, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="disa")
-            costs[sframe, cell_id, action['disappearance']] = costFactory.get_disappearance_cost()
+            costs[sframe, cell_id, action['disappearance']] = coefficients.get_disappearance_cost(
+                timepoints[sframe]['centroids'][cell_id],
+                (len(timepoints[sframe]['labels']), len(timepoints[sframe]['labels'][0])))
 
         for cell_id in timepoints[eframe]['cell_ids']:
             # appearing
             tracking[-1, eframe, -1, -1, cell_id] = tracking_model.addVar(vtype=GRB.BINARY, name="app")
-            costs[eframe, cell_id, action['appearance']] = costFactory.get_appearance_cost(timepoints[eframe]['areas'][cell_id])
+            costs[eframe, cell_id, action['appearance']] = coefficients.get_appearance_cost(
+                timepoints[eframe]['centroids'][cell_id],
+                (len(timepoints[eframe]['labels']), len(timepoints[eframe]['labels'][0])))
 
 def add_constraints():
 
@@ -196,6 +198,8 @@ def show_result():
                 new_id += 1
                 timepoints[t_plus]['cell_ids'][cell_id] = new_id
                 tracklets.insert(0, [new_id, t_plus, dot[0], dot[1]])
+            elif not segmentation[t_plus,cell_id].x:
+                timepoints[t_plus]['cell_ids'][cell_id] = 0
 
     #changing the labels
 
@@ -217,7 +221,7 @@ def show_result():
     tracklets.sort(key=lambda x: (x[0], x[1]))
     return tracklets
 
-def returnCost(event):
+def return_cost(event):
 
     global timepoints
 
@@ -280,13 +284,12 @@ def returnCost(event):
         appearing_cost = str(costs[frame, ind, action['appearance']])
         out = out + str(appearing_cost)
         if tracking[-1, frame, -1, -1, ind].x:
-            print("YES")
             out = out + " ---> Appeared"
         out = out + "\n"
 
     return out
 
-def getInstance():
+def get_instance():
 
     global timepoints
     instances = np.zeros((len(timepoints), len(timepoints[0]["labels"]), len(timepoints[0]["labels"][0])),dtype=int)
@@ -294,3 +297,6 @@ def getInstance():
     for t in range(len(timepoints)):
         instances[t] = timepoints[t]["labels"]
     return instances
+
+#def save_tracking_result():
+

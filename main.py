@@ -1,22 +1,19 @@
 from dataio import projectio
 from viz import napariviz
 from tracking import trackingsolver
-from tracking.cost_factory import cost_factory as cost_factory_fn
+from tracking.cost_factory import cost_factory
 import argparse
 
 def runTracking(project_folder):
-    # import pdb;pdb.set_trace()
-    # cost_factory = cost_factory()
-    #cost_factory = cost_factory_fn(project_folder + '/tracking/costs.yaml')
-    # cost_factory.save_parameters(project_folder + '/tracking/costs.yaml')
 
-    # print(cost_factory.parameters)
-    print(project_folder)
     raw = projectio.load_raw(project_folder)
     instances = projectio.load_instances(project_folder)
     timepoints = projectio.load_features(instances)
-    tracklets = trackingsolver.ilp(timepoints)  # <-- Sheida: NICE! ;)
+    coefficients = cost_factory()
+    tracklets = trackingsolver.ilp(timepoints,coefficients)  # <-- Sheida: NICE! ;)
     instances =projectio.load_updated_instances()
+    coefficients.save_parameters(project_folder + '/tracking/costs.yaml')
+    #save_tracking_result(project_folder)
     #napariviz.show_tracking(raw, instances, tracklets)
     return raw,instances,tracklets
 
