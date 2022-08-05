@@ -2,6 +2,7 @@ import gurobipy as gp
 from gurobipy import quicksum
 from gurobipy import GRB
 from itertools import combinations
+
 from skimage.measure import regionprops
 from tqdm import tqdm
 from scipy.spatial import KDTree
@@ -49,7 +50,6 @@ def ilp(frames,coeff):
     set_objective()
     tracking_model.optimize()
     tracklets = show_result()
-    #save_tracking_result()
     return tracklets
 
 def add_variables():
@@ -179,7 +179,7 @@ def show_result():
                     dot = timepoints[b]['centroids'][d]
                     timepoints[b]['cell_ids'][d] = timepoints[a]['cell_ids'][c]
                     tracklets.insert(0, [timepoints[a]['cell_ids'][c], b, dot[0], dot[1]])
-                if e != -1 and d != -1:
+                elif e != -1 and d != -1:
                     mother = timepoints[a]['centroids'][c]
                     daughter1 = timepoints[b]['centroids'][d]
                     new_id += 1
@@ -222,8 +222,6 @@ def show_result():
     return tracklets
 
 def return_cost(event):
-
-    global timepoints
 
     frame = int(event.position[0])
     x = int(event.position[1])
@@ -298,5 +296,67 @@ def get_instance():
         instances[t] = timepoints[t]["labels"]
     return instances
 
-#def save_tracking_result():
+def save_tracking_result(project_folder):
 
+    f = open(project_folder + '/tracking/man_track.txt', 'w',encoding='utf-8')
+
+    # saving tracking result
+    # man_track.txt - A text file representing an acyclic graph for the whole video. Every line corresponds
+    # to a single track that is encoded by four numbers separated by a space:
+    # L B E P where
+    # L - a unique label of the track (label of markers, 16-bit positive value)
+    # B - a zero-based temporal index of the frame in which the track begins
+    # E - a zero-based temporal index of the frame in which the track ends
+    # P - label of the parent track (0 is used when no parent is defined)
+
+    tracked = [0]
+    for t in range(len(timepoints) - 1):
+
+        #first time point
+        if t == 0:
+            for label in timepoints[t]['cell_ids']:
+                L = label
+                tracked.append(L)
+                B = 0
+                next = t+1
+                line = str(L) + " " + str(B) + " "
+                while label in timepoints[next]['cell_ids']:
+                    if next == len(timepoints) - 1:
+                        next += 1
+                        break
+                    else:
+                        next += 1
+                E = next-1
+                P = 0
+                line = line + str(E) + " " + str(P) + "\n"
+                f.writelines(line)
+        else:
+            for label in timepoints[t]['cell_ids']:
+                if label not in tracked:
+                    L = label
+                    tracked.append(L)
+                    B = t
+                    line = str(L) + " " + str(B) + " "
+                    next = t+1
+                    if next != len(timepoints):
+                        while label in timepoints[next]['cell_ids']:
+                            if next == len(timepoints) - 1:
+                                next += 1
+                                break
+                            else:
+                                next += 1
+                    E = next - 1
+                    line = line + str(E) + " "
+                    for (a,b,c,d,e) in tracking:
+                        if a == t-1 and b == t and (d == timepoints[t]['cell_ids'].index(L) or e == timepoints[t]['cell_ids'].index(L)) and tracking[a,b,c,d,e].x:
+                            P = timepoints[t-1]['cell_ids'][c]
+                            break
+                        elif a == -1 and b == t and e == timepoints[t]['cell_ids'].index(L) and tracking[a,b,c,d,e].x:
+                            P = 0
+                            break
+                        else:
+                            P = None
+                    line = line + str(P) + "\n"
+                    f.writelines(line)
+
+    f.close()
