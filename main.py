@@ -12,11 +12,12 @@ def runTracking(project_folder):
     timepoints = projectio.load_features(instances)
     coefficients = cost_factory()
     tracklets = trackingsolver.ilp(timepoints,coefficients)  # <-- Sheida: NICE! ;)
-    instances =projectio.load_updated_instances()
+    instances =projectio.load_updated_instances(project_folder)
     coefficients.save_parameters(project_folder + '/tracking/costs.yaml')
     save_tracking_result(project_folder)
+    tracking_GT = projectio.load_GT(project_folder)
     #napariviz.show_tracking(raw, instances, tracklets)
-    return raw,instances,tracklets
+    return raw,instances,tracklets,tracking_GT
 
 if __name__ == "__main__":
     parse = argparse.ArgumentParser()

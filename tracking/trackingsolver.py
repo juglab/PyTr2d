@@ -9,6 +9,7 @@ from scipy.spatial import KDTree
 import numpy as np
 from tracking.cost_factory import cost_factory
 
+
 # Gurobi model
 
 
@@ -310,7 +311,7 @@ def save_tracking_result(project_folder):
     # P - label of the parent track (0 is used when no parent is defined)
 
     tracked = [0]
-    for t in range(len(timepoints) - 1):
+    for t in range(len(timepoints)):
 
         #first time point
         if t == 0:

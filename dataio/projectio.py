@@ -10,7 +10,8 @@ def load_instances(project_folder):
     #todo Multiple sources of segmentation hypotheses must eventually be supported!
     return skio.imread(sorted(glob(project_folder+'/seg/somesource/*.tif')), plugin='tifffile')
 
-def load_updated_instances():
+def load_updated_instances(project_folder):
+    save_tracking(trackingsolver.get_instance(),project_folder)
     return trackingsolver.get_instance()
 
 def load_features(instances):
@@ -26,3 +27,14 @@ def load_features(instances):
     ]
 
     return feature_dict
+
+def load_GT(project_folder):
+    return skio.imread(sorted(glob(project_folder+'/ZIP/training/01_GT/TRA/*.tif')), plugin='tifffile')
+
+def save_tracking(instances,project_folder):
+    instances = instances.astype('uint16')
+    for i in range(len(instances)):
+        if i < 10:
+            skio.imsave(project_folder + '/tracking/output/mask00' + str(i) + '.tif', instances[i], plugin='tifffile')
+        elif i < 100:
+            skio.imsave(project_folder + '/tracking/output/mask0' + str(i) + '.tif', instances[i], plugin='tifffile')
