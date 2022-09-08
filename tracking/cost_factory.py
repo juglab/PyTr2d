@@ -12,30 +12,30 @@ class cost_factory:
     parameters = {
         'segmentation': [
             1,          # lambda (global scaling of this cost)
-            1,          # w_size: factor for difference in size
+            1,          # w_size: factor for size
             300,        # bias
         ],
         'appearance': [
             1,          # lambda (global scaling of this cost)
             10,          # min cost
             13,          # slope
-            400,         # max value
+            400,         # max cost
         ],
         'disappearance': [
             1,          # lambda (global scaling of this cost)
             50,          # min cost
             15,          # slope
-            500,         # max value
+            500,         # max cost
         ],
         'movement': [
             1,          # lambda (global scaling of this cost)
-            2,          # w_dist: factor for distance in pixels
+            2,          # w_dist: factor for euclidean pixel distance
             0.1,        # w_size: factor for difference in size
         ],
         'division': [
             0.5,        # lambda (global scaling of this cost)
-            1,          # w_dist: factor for distance in pixels
-            0.1,          # w_size: factor for difference in size
+            1,          # w_dist: factor for euclidean pixel distance
+            0.1,        # w_size: factor for difference in size
         ]
     }
 
