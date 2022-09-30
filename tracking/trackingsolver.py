@@ -7,19 +7,20 @@ from skimage.measure import regionprops
 from tqdm import tqdm
 from scipy.spatial import KDTree
 import numpy as np
+from scipy.spatial import distance
 from tracking.cost_factory import cost_factory
-
+from tracking.random_forest import random_forest
 
 # Gurobi model
 
 
 tracking_model = gp.Model('Tracking')
-
+tracking_model.Params.Threads = 1000
 class Action(Enum):
     SEGMENTED = 0
     MOVE = 1
-    DIVISION = 2,
-    APPEARANCE = 3,
+    DIVISION = 2
+    APPEARANCE = 3
     DISAPPEARANCE = 4
 
 segments = {
@@ -39,15 +40,17 @@ def get_key_from_value(d, val):
         return keys[0]
     return None
 
-def ilp(frames,coeff):
+def ilp(frames,classifier, coeff):
 
-    global timepoints,coefficients
+    global timepoints, clf, coefficients
     timepoints = frames
     coefficients = coeff
+    clf = classifier
     add_variables()
     tracking_model.update()
     add_constraints()
     set_objective()
+
     tracking_model.optimize()
     tracklets = show_result()
     return tracklets
@@ -68,35 +71,75 @@ def add_app_var(seg_hyp, time, cell_label):
     tracking[-1, seg_hyp, -1, time, -1, -1, cell_label] = tracking_model.addVar(vtype=GRB.BINARY, name="app")
 
 def set_seg_cost(seg_hyp,time, cell_label):
-    costs[seg_hyp, time, cell_label, Action.SEGMENTED.value] = coefficients.get_segmentation_cost(
-        timepoints[seg_hyp][time]['areas'][cell_label])
+
+    costs[seg_hyp, time, cell_label, Action.SEGMENTED.value] = -105
 
 def set_mov_cost(seg_hyp1, seg_hyp2, time, cell_label, moved_cell):
-    costs[seg_hyp1, seg_hyp2, time, cell_label, Action.MOVE.value, moved_cell] = cost_factory.get_movement_cost(coefficients,
-                                                                               timepoints[seg_hyp1][time]['areas'][cell_label],
-                                                                               timepoints[seg_hyp1][time]['centroids'][cell_label],
-                                                                               timepoints[seg_hyp2][time+1]['areas'][moved_cell],
-                                                                               timepoints[seg_hyp2][time+1]['centroids'][moved_cell])
+
+    current_intensity = timepoints[0][time]['intensity'][cell_label]
+    next_intensity = timepoints[0][time + 1]['intensity'][moved_cell]
+
+    a = current_intensity - next_intensity
+
+    current_position = timepoints[0][time]['centroids'][cell_label]
+    next_position = timepoints[0][time + 1]['centroids'][moved_cell]
+
+    b = distance.euclidean(current_position, next_position)
+
+    current_size = timepoints[0][time]['areas'][cell_label]
+    next_size = timepoints[0][time + 1]['areas'][moved_cell]
+
+    c = current_size - next_size
+    costs[seg_hyp1, seg_hyp2, time, cell_label, Action.MOVE.value, moved_cell] = clf.predict_proba([[a,b,c]])[0][0]*100
+
     # if seg_hyp1 != seg_hyp2:
     #     costs[seg_hyp1, seg_hyp2, time, cell_label, Action.MOVE.value, moved_cell] +=10
 
 def set_div_cost(seg_hyp1, seg_hyp2, time, cell_label, daughter1, daughter2):
-    costs[seg_hyp1, seg_hyp2, time, cell_label, Action.DIVISION.value, daughter1, daughter2] = coefficients.get_division_cost(
-        timepoints[seg_hyp1][time]['areas'][cell_label], timepoints[seg_hyp1][time]['centroids'][cell_label],
-        timepoints[seg_hyp2][time+1]['areas'][daughter1], timepoints[seg_hyp2][time+1]['centroids'][daughter1],
-        timepoints[seg_hyp2][time+1]['areas'][daughter2], timepoints[seg_hyp2][time+1]['centroids'][daughter2])
+
+    daughter1_intensity = timepoints[0][time+1]['intensity'][daughter1]
+    daughter2_intensity = timepoints[0][time+1]['intensity'][daughter2]
+    mother_intensity = timepoints[0][time]['intensity'][cell_label]
+
+    a = -(mother_intensity - ((daughter1_intensity + daughter2_intensity) / 2))
+
+    daughter1_position = timepoints[0][time+1]['centroids'][daughter1]
+    daughter2_position = timepoints[0][time+1]['centroids'][daughter2]
+    mother_position = timepoints[0][time]['centroids'][cell_label]
+
+    b = abs((distance.euclidean(mother_position, daughter1_position) + distance.euclidean(mother_position,
+                                                                                             daughter2_position)) / 2 - distance.euclidean(
+        daughter1_position, daughter2_position))
+
+    daughter1_size = timepoints[0][time+1]['areas'][daughter1]
+    daughter2_size = timepoints[0][time+1]['areas'][daughter2]
+    mother_size = timepoints[0][time]['areas'][cell_label]
+
+    c = mother_size - (daughter1_size + daughter2_size)
+
+    costs[seg_hyp1, seg_hyp2, time, cell_label, Action.DIVISION.value, daughter1, daughter2] = clf.predict_proba([[a,b,c]])[0][1]*100
+
     # if seg_hyp1 != seg_hyp2:
     #     costs[seg_hyp1, seg_hyp2, time, cell_label, Action.DIVISION.value, daughter1, daughter2] +=30
 
 def set_dis_cost(seg_hyp, time, cell_label):
-    costs[seg_hyp, time, cell_label, Action.DISAPPEARANCE.value] = coefficients.get_disappearance_cost(
-        timepoints[seg_hyp][time]['centroids'][cell_label],
-        (len(timepoints[seg_hyp][time]['labels']), len(timepoints[seg_hyp][time]['labels'][0])))
+
+    a = -timepoints[0][time]['intensity'][cell_label]
+    centroid = timepoints[seg_hyp][time]['centroids'][cell_label]
+    b = min(700 - centroid[0], centroid[0] - 0, 1100 - centroid[1], centroid[1] - 0)
+    c = timepoints[0][time]['areas'][cell_label]
+
+    costs[seg_hyp, time, cell_label, Action.DISAPPEARANCE.value] = clf.predict_proba([[a,b,c]])[0][3]*100
+
 
 def set_app_cost(seg_hyp, time, cell_label):
-    costs[seg_hyp, time, cell_label, Action.APPEARANCE.value] = coefficients.get_appearance_cost(
-        timepoints[seg_hyp][time]['centroids'][cell_label],
-        (len(timepoints[seg_hyp][time]['labels']), len(timepoints[seg_hyp][time]['labels'][0])))
+    a = timepoints[0][time]['intensity'][cell_label]
+    centroid = timepoints[seg_hyp][time]['centroids'][cell_label]
+    b = min(700 - centroid[0], centroid[0] - 0, 1100 - centroid[1], centroid[1] - 0)
+    c = timepoints[0][time]['areas'][cell_label]
+
+    costs[seg_hyp, time, cell_label, Action.APPEARANCE.value] = clf.predict_proba([[a,b,c]])[0][2]*100
+
 
 def add_variables():
 

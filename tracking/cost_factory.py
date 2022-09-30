@@ -1,4 +1,4 @@
-import yaml
+#import yaml
 import io
 from scipy.spatial import distance
 
