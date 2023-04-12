@@ -9,7 +9,7 @@ def load_raw(project_folder):
 
 def load_instances(project_folder):
     #todo Multiple sources of segmentation hypotheses must eventually be supported!
-    instances = np.zeros((1,10,2394,2394))
+    instances = np.zeros((1,193,2394,2394))
     #instances[1] = skio.imread(sorted(glob(project_folder+'/seg/cellpose/*.tiff')), plugin='tifffile')
     instances[0] = skio.imread(sorted(glob(project_folder+'/seg/stardist/*.tif')), plugin='tifffile')
     #for less than 10 images idk why the shape was different
