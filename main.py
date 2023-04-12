@@ -12,8 +12,8 @@ def runTracking(project_folder):
     instances = projectio.load_instances(project_folder)
     instances = instances.astype(int)
     print(instances.shape)
-    timepoints = projectio.load_features(instances)
-    coefficients = cost_factory(project_folder+ '/tracking/costs.yaml')
+    timepoints = projectio.load_features(instances) # features
+    coefficients = cost_factory()#project_folder+ '/tracking/costs.yaml')
     tracklets = trackingsolver.ilp(timepoints,coefficients)  # <-- Sheida: NICE! ;)
     instances = projectio.load_updated_instances(project_folder)
     coefficients.save_parameters(project_folder + '/tracking/costs.yaml')
@@ -24,6 +24,6 @@ def runTracking(project_folder):
 
 if __name__ == "__main__":
     parse = argparse.ArgumentParser()
-    parse.add_argument('--proj_folder', default='./data/pytr2d_projects/Fluo-N2DL-HeLa-1')
+    parse.add_argument('--proj_folder', default='./data/Pavia/5min_2023_01_20_dd_1_DD')
     args = parse.parse_args()
     runTracking(args.proj_folder)

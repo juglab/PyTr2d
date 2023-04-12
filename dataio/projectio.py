@@ -5,11 +5,11 @@ from tracking import trackingsolver
 import numpy as np
 
 def load_raw(project_folder):
-    return skio.imread(sorted(glob(project_folder+'/raw/*.tif')), plugin='tifffile')
+    return skio.imread(sorted(glob(project_folder+'/raw/sum/*.tif')), plugin='tifffile')
 
 def load_instances(project_folder):
     #todo Multiple sources of segmentation hypotheses must eventually be supported!
-    instances = np.zeros((1,92,700,1100))
+    instances = np.zeros((1,10,2394,2394))
     #instances[1] = skio.imread(sorted(glob(project_folder+'/seg/cellpose/*.tiff')), plugin='tifffile')
     instances[0] = skio.imread(sorted(glob(project_folder+'/seg/stardist/*.tif')), plugin='tifffile')
     #for less than 10 images idk why the shape was different
@@ -48,8 +48,8 @@ def save_tracking(instances,project_folder):
             skio.imsave(project_folder + '/tracking/output/mask00' + str(i) + '.tif', instances[i], plugin='tifffile')
         elif i < 100:
             skio.imsave(project_folder + '/tracking/output/mask0' + str(i) + '.tif', instances[i], plugin='tifffile')
-        # elif i < 1000:
-        #     skio.imsave(project_folder + '/tracking/output/mask0' + str(i) + '.tif', instances[i], plugin='tifffile')
+        elif i < 1000:
+            skio.imsave(project_folder + '/tracking/output/mask0' + str(i) + '.tif', instances[i], plugin='tifffile')
         # else:
         #     skio.imsave(project_folder + '/tracking/output/mask' + str(i) + '.tif', instances[i], plugin='tifffile')
 
