@@ -1,1 +1,589 @@
 # PyTr2d
+
+PyTr2d is a Python project for 2D cell tracking on Cell Tracking Challenge style data, with support for:
+
+- learning event costs from annotated training data,
+- single-source tracking on one segmentation source at a time,
+- resumable tracking runs with checkpoints,
+- a consensus mode that merges two saved tracking results,
+- and Cell Tracking Challenge style outputs (`maskNNN.tif` and `res_track.txt`).
+
+The current code is designed around the `Fluo-N2DL-HeLa` dataset layout and uses:
+
+- sequence `01` for training the event classifiers,
+- sequence `02` for tracking,
+- Gurobi for optimization,
+- random forests for event scoring.
+
+## What The Project Does
+
+PyTr2d currently has two tracking modes.
+
+### 1. `single` mode
+
+This is the default mode.
+
+- It loads one segmentation source, or several sources if `--seg-source all` is used.
+- It trains or loads four event classifiers:
+  - `move`
+  - `division`
+  - `appearance`
+  - `disappearance`
+- It then performs **pairwise ILP tracking** between consecutive frames:
+  - `(t, t+1)` for all frames in sequence `02`
+- It writes one tracked mask per frame and one lineage file.
+
+### 2. `consensus` mode
+
+This mode merges two already tracked external solutions, by default:
+
+- `embedseg`
+- `stardist`
+
+It works as follows:
+
+- If the saved `embedseg` or `stardist` tracking result is missing, it first runs the missing single-source tracking job.
+- It loads both saved tracking solutions.
+- It finds shared trajectory fragments using one-to-one frame matching with `IoU >= 0.8` and matching temporal structure.
+- These shared fragments are treated as **fixed common tracklets**.
+- The remaining non-shared fragments become hypotheses.
+- It solves one **global tracklet-level ILP** over the whole sequence.
+- It exports one final lineage solution with four different mask realizations:
+  - `intersection`
+  - `union`
+  - `embedseg`
+  - `stardist`
+
+The four consensus variants share the same lineage graph and differ only in how the fixed common tracklets are rendered geometrically.
+
+## Expected Data Layout
+
+The code expects a dataset layout like this:
+
+```text
+data/
+  Fluo-N2DL-HeLa_train/
+    Fluo-N2DL-HeLa/
+      01/
+      01_ERR_SEG/
+      01_GT/
+        TRA/
+          man_track.txt
+          *.tif
+      01_ST/
+        SEG/
+      02/
+      02_ERR_SEG/
+      02_GT/
+        TRA/
+      02_ST/
+        SEG/
+    Segmentations/
+      embedseg/
+      stardist/
+```
+
+### Meaning Of The Folders
+
+- `01/`
+  - raw training frames
+- `02/`
+  - raw tracking frames
+- `01_GT/TRA/`
+  - training ground-truth masks and `man_track.txt`
+- `02_GT/TRA/`
+  - optional evaluation ground truth for sequence `02`
+- `01_ST/SEG/`, `02_ST/SEG/`
+  - CTC `ST` segmentation folders
+- `01_ERR_SEG/`, `02_ERR_SEG/`
+  - CTC `ERR_SEG` segmentation folders
+- `Segmentations/embedseg/`, `Segmentations/stardist/`
+  - extra external segmentations used as tracking sources
+
+### Built-In Source Names Used By The Code
+
+- `st`
+  - maps to `<sequence>_ST/SEG`
+- `err_seg`
+  - maps to `<sequence>_ERR_SEG`
+- any folder name under `Segmentations/`
+  - for example `embedseg`, `stardist`
+
+By default, `--dataset-root` points to:
+
+```text
+./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa
+```
+
+and `--extra-seg-root` defaults to:
+
+```text
+./data/Fluo-N2DL-HeLa_train/Segmentations
+```
+
+if that folder exists.
+
+## Installation
+
+Core runtime dependencies are:
+
+- `numpy`
+- `scipy`
+- `gurobipy`
+- `scikit-image`
+- `scikit-learn`
+- `tifffile`
+- `tqdm`
+
+Install them in your preferred environment, for example with `uv` or `pip`.
+
+Example:
+
+```bash
+uv pip install -e .
+```
+
+or:
+
+```bash
+pip install -e .
+```
+
+You also need a working Gurobi installation and license.
+
+## Command Line Interface
+
+The main entrypoint is:
+
+```bash
+uv run python main.py
+```
+
+### Important CLI Flags
+
+- `--mode {single,consensus}`
+  - choose the tracking mode
+- `--dataset-root`
+  - dataset folder containing `01`, `02`, `*_GT`, `*_ST`, and `*_ERR_SEG`
+- `--extra-seg-root`
+  - external segmentation folder such as `Segmentations`
+- `--train-sequence`
+  - defaults to `01`
+- `--track-sequence`
+  - defaults to `02`
+- `--seg-source`
+  - used in `single` mode, defaults to `all`
+- `--consensus-sources SOURCE_1 SOURCE_2`
+  - used in `consensus` mode, defaults to `embedseg stardist`
+- `--agreement-iou-threshold`
+  - used in `consensus` mode, defaults to `0.8`
+- `--max-distance`
+  - maximum centroid distance for move and division candidates, defaults to `50`
+- `--output-dir`
+  - output directory for `single` mode
+- `--consensus-output-dir`
+  - output directory for `consensus` mode
+- `--model-dir`
+  - root directory for saved classifier bundles
+- `--force-retrain`
+  - ignore any saved classifier bundle and retrain the four random forests
+- `--force-retrack`
+  - ignore saved tracking checkpoints and rebuild tracking from frame `0`
+- `--log-file`
+  - path to the run log file
+- `--log-level {DEBUG,INFO,WARNING,ERROR}`
+  - terminal logging level
+
+## Logging
+
+Every run logs to:
+
+- the terminal
+- and a logfile on disk
+
+By default:
+
+- in `single` mode:
+  - `<output-dir>/run.log`
+- in `consensus` mode:
+  - `<consensus-output-dir>/run.log`
+
+Use:
+
+```bash
+--log-level DEBUG
+```
+
+for more verbose logging.
+
+Gurobi is also configured to log to the terminal and to the same logfile.
+
+## Classifier Training And Reuse
+
+PyTr2d uses four random-forest classifiers:
+
+- `move`
+- `division`
+- `appearance`
+- `disappearance`
+
+They are trained from:
+
+- the raw images in sequence `01`
+- the segmentation sources available for training in sequence `01`
+- the tracking GT in `01_GT/TRA`
+
+### Default Model Bundle Location
+
+Saved classifier bundles are written to:
+
+```text
+models/<dataset-name>/<train-sequence>/event_scorers.pkl
+```
+
+For the default dataset and training sequence, that means:
+
+```text
+models/Fluo-N2DL-HeLa/01/event_scorers.pkl
+```
+
+### Bundle Reuse Rules
+
+On each run:
+
+- if a compatible bundle exists, it is loaded,
+- if it is missing, the classifiers are trained and saved,
+- if metadata does not match the current configuration, the classifiers are retrained,
+- if `--force-retrain` is given, the classifiers are always rebuilt.
+
+The saved metadata includes:
+
+- dataset name
+- training sequence
+- feature version
+- `max_distance`
+- training IoU threshold
+- random-forest hyperparameters
+
+## Single-Mode Tracking
+
+### Example: Track Only `stardist`
+
+```bash
+uv run python main.py \
+  --mode single \
+  --dataset-root ./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa \
+  --extra-seg-root ./data/Fluo-N2DL-HeLa_train/Segmentations \
+  --seg-source stardist
+```
+
+### Example: Track Only `embedseg`
+
+```bash
+uv run python main.py --mode single --seg-source embedseg
+```
+
+### Example: Track All Available Sources Together
+
+```bash
+uv run python main.py --mode single --seg-source all
+```
+
+### How Single Mode Works
+
+- Frame `0` is initialized from the selected segmentation source.
+- If multiple sources are selected, frame `0` is initialized by a small overlap-aware ILP.
+- Each following frame pair is solved by a pairwise ILP.
+- The code supports:
+  - movement
+  - division
+  - appearance
+  - disappearance
+- Tracking checkpoints are saved after every completed frame.
+
+### Resume Behavior
+
+Single mode writes:
+
+- `maskNNN.tif`
+- `res_track.txt`
+- `tracking_checkpoint.json`
+
+If a run is interrupted:
+
+- the next run resumes from the last completed frame,
+- unless `--force-retrack` is used.
+
+## Consensus Mode
+
+### Example: Merge `embedseg` And `stardist`
+
+```bash
+uv run python main.py \
+  --mode consensus \
+  --dataset-root ./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa \
+  --extra-seg-root ./data/Fluo-N2DL-HeLa_train/Segmentations \
+  --consensus-sources embedseg stardist
+```
+
+### What Consensus Mode Uses
+
+Consensus mode only uses the two named **external** source results as inputs.
+
+It does **not** use:
+
+- `GT`
+- `ST`
+- `ERR_SEG`
+
+as source solutions for the merge.
+
+### How Consensus Mode Works
+
+1. Check whether the two saved source-specific tracking results already exist.
+2. If one is missing or incomplete, run that single-source tracker first.
+3. Load both saved tracked mask stacks and lineage files.
+4. Match objects frame by frame with one-to-one IoU matching.
+5. Keep only matched object pairs with `IoU >= 0.8` by default.
+6. Build common tracklets from shared trajectory fragments.
+7. Treat these common tracklets as fixed.
+8. Convert the remaining fragments from both solutions into hypothesis tracklets.
+9. Solve one global tracklet-level ILP over the whole sequence.
+10. Export four final mask variants from the same lineage solution.
+
+### Consensus Output Variants
+
+For fixed common tracklets, the final masks can be rendered in four ways:
+
+- `intersection`
+  - pixelwise intersection of the two source masks
+- `union`
+  - pixelwise union of the two source masks
+- `embedseg`
+  - always use the `embedseg` geometry for the fixed common parts
+- `stardist`
+  - always use the `stardist` geometry for the fixed common parts
+
+For non-common selected hypothesis fragments:
+
+- the geometry always comes from the source that generated that fragment
+
+All four consensus variants have:
+
+- the same selected lineage solution
+- the same `res_track.txt`
+- different `maskNNN.tif` files
+
+## Output Conventions
+
+### Single Mode Outputs
+
+By default:
+
+```text
+outputs/<dataset-name>/<track-sequence>/<seg-source>/
+```
+
+Example:
+
+```text
+outputs/Fluo-N2DL-HeLa/02/stardist/
+```
+
+Contains:
+
+- `mask000.tif`, `mask001.tif`, ...
+- `res_track.txt`
+- `tracking_checkpoint.json`
+- `run.log`
+
+### Consensus Mode Outputs
+
+By default:
+
+```text
+outputs/<dataset-name>/<track-sequence>/consensus_<source1>_<source2>/
+```
+
+Example:
+
+```text
+outputs/Fluo-N2DL-HeLa/02/consensus_embedseg_stardist/
+```
+
+Contains:
+
+- `run.log`
+- `premerge_metrics.json`
+- `premerge_metrics.txt`
+- `variant_comparison.json`
+- `variant_comparison.txt`
+- `intersection/`
+- `union/`
+- `embedseg/`
+- `stardist/`
+
+Each variant folder contains:
+
+- `mask000.tif`, `mask001.tif`, ...
+- `res_track.txt`
+- `metrics.json`
+- `metrics.txt`
+
+## Evaluation Metrics
+
+PyTr2d reports two levels of evaluation in consensus mode.
+
+### 1. Pre-Merge Metrics
+
+These compare the two input tracking solutions before consensus merging.
+
+Agreement metrics:
+
+- object precision
+- object recall
+- object F1
+- move precision
+- move recall
+- move F1
+- division precision
+- division recall
+- division F1
+- shared tracklet coverage
+
+If `02_GT/TRA` exists, PyTr2d also evaluates each input solution against GT using:
+
+- vertex precision
+- vertex recall
+- vertex F1
+- link precision
+- link recall
+- link F1
+- `CT`
+  - complete tracks
+- `TF`
+  - track fractions
+- `BC(0)`
+  - branching correctness with zero-frame tolerance
+- `BIO`
+  - mean of `CT`, `TF`, and `BC(0)`
+
+### 2. Final Variant Metrics
+
+For each final variant (`intersection`, `union`, `embedseg`, `stardist`), PyTr2d writes:
+
+- GT-based metrics if `02_GT` exists:
+  - vertex precision
+  - vertex recall
+  - vertex F1
+  - link precision
+  - link recall
+  - link F1
+  - `CT`
+  - `TF`
+  - `BC(0)`
+  - `BIO`
+- summary metrics even without GT:
+  - number of tracks
+  - number of divisions
+  - number of frames
+  - frame object count min/mean/max
+  - common tracklet coverage
+
+The root-level `variant_comparison.*` files compare the four final variants side by side.
+
+## Cell Tracking Challenge Output Format
+
+The final outputs follow the usual CTC-style convention:
+
+- one tracked mask per frame:
+  - `mask000.tif`, `mask001.tif`, ...
+- one lineage file:
+  - `res_track.txt`
+
+Each row of `res_track.txt` has:
+
+```text
+track_id begin end parent
+```
+
+where:
+
+- `track_id`
+  - final track identifier
+- `begin`
+  - first frame index of the track
+- `end`
+  - last frame index of the track
+- `parent`
+  - parent track id, or `0` if the track has no parent
+
+## Typical Workflows
+
+### Train Classifiers And Track One Source
+
+```bash
+uv run python main.py --mode single --seg-source stardist
+```
+
+### Force Rebuild Of The Classifier Bundle
+
+```bash
+uv run python main.py --mode single --seg-source stardist --force-retrain
+```
+
+### Resume A Previous Single-Source Tracking Run
+
+```bash
+uv run python main.py --mode single --seg-source embedseg
+```
+
+If a valid checkpoint exists, it resumes automatically.
+
+### Restart Tracking From Scratch
+
+```bash
+uv run python main.py --mode single --seg-source embedseg --force-retrack
+```
+
+### Run The Full Consensus Merge
+
+```bash
+uv run python main.py --mode consensus --consensus-sources embedseg stardist
+```
+
+## Testing
+
+Run the unit tests with:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+The dataset smoke tests are opt-in:
+
+```bash
+PYTR2D_RUN_SMOKE=1 uv run python -m unittest discover -s tests -v
+```
+
+## Notes And Current Scope
+
+- The code is currently focused on 2D tracking.
+- The main target layout is `Fluo-N2DL-HeLa`.
+- Event scorers are trained on sequence `01` and tracking is run on sequence `02`.
+- `single` mode uses pairwise frame-to-frame ILPs.
+- `consensus` mode uses a global tracklet-level ILP on top of two saved single-source tracking results.
+- The project is designed to log heavily to both terminal and file for long runs.
+
+## Repository Entry Points
+
+- [main.py](main.py)
+  - CLI entrypoint and orchestration
+- [dataio/projectio.py](dataio/projectio.py)
+  - data loading, saved-result loading, output writing
+- [tracking/random_forest.py](tracking/random_forest.py)
+  - event features and classifier training/loading
+- [tracking/trackingsolver.py](tracking/trackingsolver.py)
+  - single-mode pairwise ILP tracker
+- [tracking/consensus.py](tracking/consensus.py)
+  - consensus preparation, global tracklet ILP, variant rendering, metrics

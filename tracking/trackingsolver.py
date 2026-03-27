@@ -1,482 +1,637 @@
-import gurobipy as gp
-from gurobipy import quicksum
-from gurobipy import GRB
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
 from itertools import combinations
-from enum import Enum
-from skimage.measure import regionprops
-from tqdm import tqdm
-from scipy.spatial import KDTree
+import logging
+from pathlib import Path
+
+import gurobipy as gp
 import numpy as np
-from scipy.spatial import distance
-from tracking.cost_factory import cost_factory
-from tracking.random_forest import random_forest
-
-
-# Gurobi model
-
-
-tracking_model = gp.Model('Tracking')
-tracking_model.Params.Threads = 1000
-class Action(Enum):
-    SEGMENTED = 0
-    MOVE = 1
-    DIVISION = 2
-    APPEARANCE = 3
-    DISAPPEARANCE = 4
-
-segments = {
-    'stardist': 0,
-    'embedseg': 1
-}
-
-segmentation = {}
-tracking = {}
-costs = {}
-timepoints = []
-coefficients = {}
-
-def get_key_from_value(d, val):
-    keys = [k for k, v in d.items() if v == val]
-    if keys:
-        return keys[0]
-    return None
-
-def ilp(frames,classifier1, norm1, classifier2, norm2, classifier3, norm3, classifier4, norm4, coeff):
-
-    global timepoints, clf_mov, norm_mov, clf_div, norm_div, clf_app, norm_app, clf_dis, norm_dis, coefficients
-    timepoints = frames
-    coefficients = coeff
-    clf_mov = classifier1
-    norm_mov = norm1
-    clf_div = classifier2
-    norm_div = norm2
-    clf_app = classifier3
-    norm_app = norm3
-    clf_dis = classifier4
-    norm_dis = norm4
-    add_variables()
-    tracking_model.update()
-    add_constraints()
-    set_objective()
-
-    tracking_model.optimize()
-    tracklets = show_result()
-    return tracklets
-
-def add_seg_var(seg_hyp, time, cell_label):
-    segmentation[seg_hyp, time, cell_label] = tracking_model.addVar(vtype=GRB.BINARY, name="segmentation")
-
-def add_mov_var(seg_hyp1, seg_hyp2, time, cell_label, moved_cell):
-    tracking[seg_hyp1, seg_hyp2, time, time+1, cell_label, moved_cell, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="move")
-
-def add_div_var(seg_hyp1, seg_hyp2, time, cell_label, daughter1, daughter2):
-    tracking[seg_hyp1, seg_hyp2, time, time+1, cell_label, daughter1, daughter2] = tracking_model.addVar(vtype=GRB.BINARY, name="division")
-
-def add_dis_var(seg_hyp, time, cell_label):
-    tracking[seg_hyp, -1, time, -1, cell_label, -1, -1] = tracking_model.addVar(vtype=GRB.BINARY, name="disa")
-
-def add_app_var(seg_hyp, time, cell_label):
-    tracking[-1, seg_hyp, -1, time, -1, -1, cell_label] = tracking_model.addVar(vtype=GRB.BINARY, name="app")
-
-def set_seg_cost(seg_hyp,time, cell_label):
-
-    costs[seg_hyp, time, cell_label, Action.SEGMENTED.value] = -105
-
-def set_mov_cost(seg_hyp1, seg_hyp2, time, cell_label, moved_cell):
-
-    current_intensity = timepoints[0][time]['intensity'][cell_label]
-    next_intensity = timepoints[0][time + 1]['intensity'][moved_cell]
-
-    current_position = timepoints[0][time]['centroids'][cell_label]
-    next_position = timepoints[0][time + 1]['centroids'][moved_cell]
-
-    diff_distance = distance.euclidean(current_position, next_position)
-
-    current_size = timepoints[0][time]['areas'][cell_label]
-    next_size = timepoints[0][time + 1]['areas'][moved_cell]
-
-    costs[seg_hyp1, seg_hyp2, time, cell_label, Action.MOVE.value, moved_cell] = \
-    clf_mov.predict_proba(norm_mov.transform([[current_intensity, next_intensity, diff_distance, current_size, next_size]]))[0][0] * 100
-
-def set_div_cost(seg_hyp1, seg_hyp2, time, cell_label, daughter1, daughter2):
-
-    daughter1_intensity = timepoints[0][time+1]['intensity'][daughter1]
-    daughter2_intensity = timepoints[0][time+1]['intensity'][daughter2]
-    mother_intensity = timepoints[0][time]['intensity'][cell_label]
-
-    daughter1_position = timepoints[0][time+1]['centroids'][daughter1]
-    daughter2_position = timepoints[0][time+1]['centroids'][daughter2]
-    mother_position = timepoints[0][time]['centroids'][cell_label]
-
-    d1 = distance.euclidean(mother_position, daughter1_position)
-    d2 = distance.euclidean(mother_position, daughter2_position)
-    d3 = distance.euclidean(daughter1_position, daughter2_position)
-
-
-    daughter1_size = timepoints[0][time+1]['areas'][daughter1]
-    daughter2_size = timepoints[0][time+1]['areas'][daughter2]
-    mother_size = timepoints[0][time]['areas'][cell_label]
-
-    costs[seg_hyp1, seg_hyp2, time, cell_label, Action.DIVISION.value, daughter1, daughter2] = \
-    clf_div.predict_proba(norm_div.transform([[mother_intensity, daughter1_intensity, daughter2_intensity, d1, d2, d3, mother_size, daughter1_size, daughter2_size]]))[0][0] * 100
-
-def set_dis_cost(seg_hyp, time, cell_label):
-
-    a = timepoints[0][time]['intensity'][cell_label]
-    centroid = timepoints[seg_hyp][time]['centroids'][cell_label]
-    b = min(700 - centroid[0], centroid[0] - 0, 1100 - centroid[1], centroid[1] - 0)
-    c = timepoints[0][time]['areas'][cell_label]
-
-    costs[seg_hyp, time, cell_label, Action.DISAPPEARANCE.value] = \
-    clf_dis.predict_proba(norm_dis.transform([[a, b, c]]))[0][0] * 100
-
-
-def set_app_cost(seg_hyp, time, cell_label):
-    a = timepoints[0][time]['intensity'][cell_label]
-    centroid = timepoints[seg_hyp][time]['centroids'][cell_label]
-    b = min(700 - centroid[0], centroid[0] - 0, 1100 - centroid[1], centroid[1] - 0)
-    c = timepoints[0][time]['areas'][cell_label]
-
-    costs[seg_hyp, time, cell_label, Action.APPEARANCE.value] = clf_app.predict_proba(norm_app.transform([[a, b, c]]))[0][
-                                                                    0] * 100
-
-def add_variables():
-
-    global timepoints
-
-    for seg_hyp in range(len(timepoints)):
-        for sframe in range(len(timepoints[0]) - 1):
-            for cell_id in timepoints[seg_hyp][sframe]['cell_ids']:
-                add_seg_var(seg_hyp, sframe, cell_id)
-                set_seg_cost(seg_hyp, sframe, cell_id)
-
-                # disappearing
-                add_dis_var(seg_hyp, sframe, cell_id)
-                set_dis_cost(seg_hyp, sframe, cell_id)
-
-            eframe = sframe + 1
-
-            if eframe == len(timepoints[0]) - 1:
-                for cell_id in timepoints[seg_hyp][eframe]['cell_ids']:
-                    add_seg_var(seg_hyp, eframe, cell_id)
-                    set_seg_cost(seg_hyp, eframe, cell_id)
-
-            for cell_id in timepoints[seg_hyp][eframe]['cell_ids']:
-                # appearing
-                add_app_var(seg_hyp, eframe, cell_id)
-                set_app_cost(seg_hyp, eframe, cell_id)
-
-    for seg_hyp1 in range(len(timepoints)):
-        for seg_hyp2 in range(len(timepoints)):
-            for sframe in range(len(timepoints[0]) - 1):
-
-                for cell_id in timepoints[seg_hyp1][sframe]['cell_ids']:
-
-                    neighborhood = get_neighborhood(seg_hyp1, seg_hyp2, sframe, cell_id)
-
-                    # move
-                    if len(neighborhood) > 0:
-                        for n in neighborhood:
-                            add_mov_var(seg_hyp1,seg_hyp2,sframe,cell_id,n)
-                            # giving the size of cells and their centroids in each time point
-                            set_mov_cost(seg_hyp1,seg_hyp2,sframe,cell_id,n)
-
-                    # division
-                    if len(neighborhood) > 1:
-
-                        siblings = combinations(neighborhood,2)
-                        for i in siblings:
-                            n1 = i[0]
-                            n2 = i[1]
-                            add_div_var(seg_hyp1,seg_hyp2,sframe,cell_id,n1,n2)
-                            set_div_cost(seg_hyp1,seg_hyp2,sframe,cell_id,n1,n2)
-
-def add_constraints():
-
-    global timepoints
-    for hyp in range(len(timepoints)):
-        for sframe in tqdm(range(len(timepoints[hyp]) - 1), desc="adding constraints to the model"):
-
-            eframe = sframe + 1
-            for cell_id in timepoints[hyp][sframe]['cell_ids']:
-                # a cell in each timeframe can either move, divide or disappear (zero when it's not segmented)
-                tracking_model.addConstr(
-                    quicksum(tracking[h1, h2, a, b, c, d, e] for (h1, h2, a, b, c, d, e) in tracking if
-                             a == sframe and c == cell_id and h1 == hyp) == segmentation[hyp, sframe, cell_id])
-
-            for cell_id in timepoints[hyp][eframe]['cell_ids']:
-                # a cell in each timepoint can either be a daughter of a cell/moved/appeared (zero when it's not segmented)
-                tracking_model.addConstr(
-                    quicksum(tracking[h1, h2, a, b, c, d, e] for (h1, h2, a, b, c, d, e) in tracking if
-                             h2 == hyp and b == eframe and (d == cell_id or e == cell_id)) == segmentation[
-                        hyp, eframe, cell_id])
-
-
-    #segmentation overlapping conflicts
-    for t in tqdm(range(len(timepoints[0])), desc="adding combinatorial constraints"):
-        for hyp1 in range(len(timepoints)-1):
-            for hyp2 in range(hyp1+1,len(timepoints)):
-                for cell1 in timepoints[hyp1][t]['cell_ids']:
-                    for cell2 in timepoints[hyp2][t]['cell_ids']:
-                        a = timepoints[hyp1][t]['coords'][cell1]
-                        b = timepoints[hyp2][t]['coords'][cell2]
-                        if [x for x in a if x in b]:
-                            tracking_model.addConstr(segmentation[hyp1, t, cell1] + segmentation[hyp2, t, cell2] <=1)
-
-def set_objective():
-
-    tracking_model.setObjective(quicksum(costs[hyp, frame, cell_id, Action.SEGMENTED.value] * segmentation[hyp, frame, cell_id] \
-                                         for (hyp, frame,cell_id) in segmentation) + \
-                                quicksum(costs[hyp1, hyp2, sframe,cell_id,Action.MOVE.value,x] * tracking[hyp1, hyp2, sframe,eframe,cell_id,x,y] \
-                            for (hyp1, hyp2, sframe,eframe,cell_id,x,y) in tracking if x != -1 and y == -1) + \
-                                quicksum(costs[hyp1, hyp2, sframe,cell_id,Action.DIVISION.value,x,y] * tracking[hyp1, hyp2, sframe,eframe,cell_id,x,y] \
-                            for (hyp1, hyp2, sframe,eframe,cell_id,x,y) in tracking if x != -1 and y != -1) + \
-                                quicksum(costs[hyp1, sframe,cell_id,Action.DISAPPEARANCE.value] * tracking[hyp1, hyp2, sframe,eframe,cell_id,x,y] \
-                            for (hyp1, hyp2, sframe,eframe,cell_id,x,y) in tracking if eframe == -1 and x == -1 and y == -1 and hyp2 == -1) + \
-                                quicksum(costs[hyp2, eframe,cell_id,Action.APPEARANCE.value] * tracking[hyp1, hyp2, sframe,eframe,x,y,cell_id] \
-                            for (hyp1, hyp2, sframe,eframe,x,y,cell_id) in tracking if sframe == -1 and x == -1 and y == -1 and hyp1 == -1), GRB.MINIMIZE)
-
-def get_neighborhood(h1, h2, sframe, cell_id):
-
-#####################################
-    max_movement = 50
-#####################################
-    eframe = sframe + 1
-    s_kd_tree = KDTree(timepoints[h1][sframe]['centroids'])
-    e_kd_tree = KDTree(timepoints[h2][eframe]['centroids'])
-
-    neighborhood = s_kd_tree.query_ball_tree(e_kd_tree, max_movement)
-
-    return neighborhood[cell_id]
-
-def show_result():
-
-    global timepoints
-
-    #changing the ids and generating tracklets
-    new_id = 0
-    tracklets = []
-    for t in range(len(timepoints[0]) - 1):
-        t_plus = t+1
-        #first time point
-        if t == 0:
-            for h in range(len(timepoints)):
-                for dot in timepoints[h][t]['centroids']:
-                    cell_id = timepoints[h][t]['centroids'].index(dot)
-                    if segmentation[h,t,cell_id].x:
-                        new_id += 1
-                        timepoints[h][t]['cell_ids'][cell_id] = new_id
-                        tracklets.insert(0,[new_id,t,dot[0],dot[1]])
-                    else:
-                        timepoints[h][t]['cell_ids'][cell_id] = 0
-
-        for (h1,h2,a,b,c,d,e) in tracking:
-            if a == t and b == t_plus and tracking[h1,h2,a,b,c,d,e].x:
-                #move - so the id remains the same
-                if e == -1 and d != -1:
-                    dot = timepoints[h2][b]['centroids'][d]
-                    timepoints[h2][b]['cell_ids'][d] = timepoints[h1][a]['cell_ids'][c]
-                    tracklets.insert(0, [timepoints[h1][a]['cell_ids'][c], b, dot[0], dot[1]])
-                elif e != -1 and d != -1:
-                    mother = timepoints[h1][a]['centroids'][c]
-                    daughter1 = timepoints[h2][b]['centroids'][d]
-                    new_id += 1
-                    timepoints[h2][b]['cell_ids'][d] = new_id
-                    tracklets.insert(0, [new_id, a, mother[0], mother[1]])
-                    tracklets.insert(0, [new_id, b, daughter1[0], daughter1[1]])
-                    daughter2 = timepoints[h2][b]['centroids'][e]
-                    new_id += 1
-                    timepoints[h2][b]['cell_ids'][e] = new_id
-                    tracklets.insert(0, [new_id, a, mother[0], mother[1]])
-                    tracklets.insert(0, [new_id, b, daughter2[0], daughter2[1]])
-        for h in range(len(timepoints)):
-            for dot in timepoints[h][t_plus]['centroids']:
-                cell_id = timepoints[h][t_plus]['centroids'].index(dot)
-                if tracking[-1,h,-1,t_plus, -1,-1,cell_id].x:
-                    new_id += 1
-                    timepoints[h][t_plus]['cell_ids'][cell_id] = new_id
-                    tracklets.insert(0, [new_id, t_plus, dot[0], dot[1]])
-                if not segmentation[h,t_plus,cell_id].x:
-                    timepoints[h][t_plus]['cell_ids'][cell_id] = 0
-
-    #changing the labels
-
-    #for t in range(len(timepoints)):
-        #print(len(timepoints[t]['cell_ids']),timepoints[t]['cell_ids'])
-    #_, axs = plt.subplots(1, 2)
-
-    #axs[0].imshow(timepoints[4]['labels'], cmap='hot')
-    for h in range(len(timepoints)):
-        for t in range(len(timepoints[h])):
-            RP = regionprops(timepoints[h][t]['labels'])
-            for index in range(len(RP)):
-                for (i,j) in RP[index].coords:
-                    timepoints[h][t]['labels'][i][j] = timepoints[h][t]['cell_ids'][index]
-
-    #axs[1].imshow(timepoints[4]['labels'],cmap='hot')
-    #plt.show()
-
-    tracklets.sort(key=lambda x: (x[0], x[1]))
-    return tracklets
-
-def return_cost(event):
-
-    frame = int(event.position[0])
-    x = int(event.position[1])
-    y = int(event.position[2])
-
-    id = timepoints[frame]["labels"][x][y]
-    ind = timepoints[frame]['cell_ids'].index(id)
-
-    out = ""
-
-    #out = out + str(timepoints[frame]['intensity'][ind]) + "\n"
-
-    out = out + "Cost Function for cell with ID " +str(id)+ "\n\nSegmentation Cost: "
-
-    segmentation_cost = str(costs[frame,ind,Action.SEGMENTED.value])
-
-    out = out + segmentation_cost\
-
-    if segmentation[frame, ind].x:
-        out = out + " ---> Segmented"
-
-    out = out + "\n"
-
-    out = out + "\nMoving Cost:\nto cell with ID:\n"
-
-    for key,value in costs.items():
-        if len(key) == 4:
-            if key[0] == frame and key[1] == ind and key[2] == Action.MOVE.value:
-                out = out + str(timepoints[frame+1]['cell_ids'][key[3]])
-                out = out + " is "
-                out = out + str(value)
-                if tracking[frame, frame+1, ind, key[3],-1].x:
-                    out = out + " ---> Will move"
-                out = out + "\n"
-
-    out = out + "\nDivision Cost:\nto cell with IDs:\n"
-
-    for key, value in costs.items():
-        if len(key) == 5:
-            if key[0] == frame and key[1] == ind and key[2] == Action.DIVISION.value:
-                out = out + str(timepoints[frame + 1]['cell_ids'][key[3]])
-                out = out + " and "
-                out = out + str(timepoints[frame + 1]['cell_ids'][key[4]])
-                out = out + " is "
-                out = out + str(value)
-                if tracking[frame, frame+1, ind, key[3], key[4]].x:
-                    out = out + " ---> Will divide"
-                out = out + "\n"
-
-    if frame >=0 and frame < len(timepoints)-1:
-        out = out + "\nDisappearing Cost is: "
-        disappearing_cost = str(costs[frame, ind, Action.DISAPPEARANCE.value])
-        out = out + str(disappearing_cost)
-        if tracking[frame, -1, ind, -1, -1].x:
-            out = out + " ---> Will disappear"
-        out = out + "\n"
-
-    if frame >=1 and frame < len(timepoints):
-        out = out + "\nAppearing Cost is: "
-        appearing_cost = str(costs[frame, ind, Action.APPEARANCE.value])
-        out = out + str(appearing_cost)
-        if tracking[-1, frame, -1, -1, ind].x:
-            out = out + " ---> Appeared"
-        out = out + "\n"
-
-    return out
-
-def get_instance():
-
-    global timepoints
-    instances = np.zeros((len(timepoints[0]), len(timepoints[0][0]["labels"]), len(timepoints[0][0]["labels"][0])),dtype=int)
-    print(instances.shape)
-    for t in range(len(timepoints[0])):
-        for h in range(len(timepoints)):
-            instances[t] = instances[t] + timepoints[h][t]["labels"]
-    return instances
-
-def save_tracking_result(project_folder):
-
-    f = open(project_folder + '/tracking/res_track.txt', 'w',encoding='utf-8')
-
-    # saving tracking result
-    # man_track.txt - A text file representing an acyclic graph for the whole video. Every line corresponds
-    # to a single track that is encoded by four numbers separated by a space:
-    # L B E P where
-    # L - a unique label of the track (label of markers, 16-bit positive value)
-    # B - a zero-based temporal index of the frame in which the track begins
-    # E - a zero-based temporal index of the frame in which the track ends
-    # P - label of the parent track (0 is used when no parent is defined)
-
-    tracked = [0]
-    for t in range(len(timepoints[0])):
-
-        #first time point
-        if t == 0:
-            for h in range(len(timepoints)):
-                for label in timepoints[h][t]['cell_ids']:
-                    if label != 0:
-                        L = label
-                        tracked.append(L)
-                        B = 0
-                        next = t+1
-                        line = str(L) + " " + str(B) + " "
-                        if len(timepoints) == 2:
-                            while label in timepoints[0][next]['cell_ids'] or label in timepoints[1][next]['cell_ids']:
-                                if next == len(timepoints[0]) - 1:
-                                    next += 1
-                                    break
-                                else:
-                                    next += 1
-                        else:
-                            while label in timepoints[0][next]['cell_ids']:
-                                if next == len(timepoints[0]) - 1:
-                                    next += 1
-                                    break
-                                else:
-                                    next += 1
-                        E = next-1
-                        P = 0
-                        line = line + str(E) + " " + str(P) + "\n"
-                        f.writelines(line)
+from gurobipy import GRB, quicksum
+
+from dataio import projectio
+from tracking.random_forest import EventScorers, candidate_neighborhoods
+from tracking.types import FrameObjects, LineageRecord, TrackingCheckpoint, TrackingConfig, TrackingResult
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+CurrentKey = int
+NextKey = tuple[str, int]
+MoveKey = tuple[int, str, int]
+DivisionKey = tuple[int, str, int, int]
+CHECKPOINT_VERSION = 1
+
+
+@dataclass(slots=True)
+class ResumeState:
+    completed_frame: int
+    canonical_frames: list[FrameObjects]
+    tracked_masks: np.ndarray
+    lineage_state: dict[int, list[int]]
+    next_track_id: int
+
+
+def solve_tracking(
+    config: TrackingConfig,
+    raw_frames: np.ndarray,
+    frames_by_source: dict[str, list[FrameObjects]],
+    scorers: EventScorers,
+) -> TrackingResult:
+    if not frames_by_source:
+        raise ValueError("At least one segmentation source is required for tracking.")
+
+    source_names = tuple(frames_by_source.keys())
+    frame_count = len(raw_frames)
+    reference_shape = tuple(int(value) for value in raw_frames[0].shape)
+    _validate_frames(raw_frames, frames_by_source, frame_count, reference_shape)
+    output_dir = projectio.resolve_output_dir(config)
+    LOGGER.info(
+        "Preparing pairwise tracking for %s source(s), %s frame(s), frame shape %s.",
+        len(source_names),
+        frame_count,
+        reference_shape,
+    )
+
+    resume_state = maybe_resume_tracking(
+        config=config,
+        raw_frames=raw_frames,
+        output_dir=output_dir,
+        source_names=source_names,
+        frame_count=frame_count,
+        reference_shape=reference_shape,
+    )
+
+    if resume_state is None:
+        canonical_frames: list[FrameObjects] = []
+        tracked_masks = np.zeros((frame_count, *reference_shape), dtype=np.uint16)
+        current_frame = initialize_first_frame(
+            config,
+            raw_frames[0],
+            {name: frames[0] for name, frames in frames_by_source.items()},
+        )
+        canonical_frames.append(current_frame)
+        tracked_masks[0] = current_frame.label_image
+        lineage_state: dict[int, list[int]] = {
+            track_id: [0, 0, 0]
+            for track_id in current_frame.raw_label_ids
+        }
+        next_track_id = max(current_frame.raw_label_ids, default=0) + 1
+        LOGGER.info("Frame 0 initialization produced %s track(s).", current_frame.object_count)
+        persist_tracking_progress(
+            output_dir=output_dir,
+            config=config,
+            source_names=source_names,
+            frame_count=frame_count,
+            reference_shape=reference_shape,
+            completed_frame=0,
+            frame_mask=current_frame.label_image,
+            lineage_state=lineage_state,
+            next_track_id=next_track_id,
+        )
+        start_frame = 0
+    else:
+        canonical_frames = resume_state.canonical_frames
+        tracked_masks = resume_state.tracked_masks
+        current_frame = canonical_frames[-1]
+        lineage_state = resume_state.lineage_state
+        next_track_id = resume_state.next_track_id
+        start_frame = resume_state.completed_frame
+        if start_frame >= frame_count - 1:
+            LOGGER.info("Checkpoint already covers the final frame; loading finished tracking result.")
+            return build_tracking_result(source_names, canonical_frames, tracked_masks, lineage_state)
+
+    for frame_index in range(start_frame, frame_count - 1):
+        next_frames = {name: frames[frame_index + 1] for name, frames in frames_by_source.items()}
+        current_frame, next_track_id = solve_frame_pair(
+            config=config,
+            frame_index=frame_index,
+            current_frame=current_frame,
+            next_frames=next_frames,
+            next_raw_frame=raw_frames[frame_index + 1],
+            scorers=scorers,
+            lineage_state=lineage_state,
+            next_track_id=next_track_id,
+        )
+        if len(canonical_frames) > frame_index + 1:
+            canonical_frames[frame_index + 1] = current_frame
         else:
-            for h in range(len(timepoints)):
-                for label in timepoints[h][t]['cell_ids']:
-                    if label not in tracked:
-                        L = label
-                        tracked.append(L)
-                        B = t
-                        line = str(L) + " " + str(B) + " "
-                        next = t+1
-                        if next != len(timepoints[0]):
-                            if len(timepoints) == 2:
-                                while label in timepoints[0][next]['cell_ids'] or label in timepoints[1][next]['cell_ids']:
-                                    if next == len(timepoints[0]) - 1:
-                                        next += 1
-                                        break
-                                    else:
-                                        next += 1
-                            else:
-                                while label in timepoints[0][next]['cell_ids']:
-                                    if next == len(timepoints[0]) - 1:
-                                        next += 1
-                                        break
-                                    else:
-                                        next += 1
-                        E = next - 1
-                        line = line + str(E) + " "
-                        for (h1,h2,a,b,c,d,e) in tracking:
-                            if a == t-1 and b == t and (d == timepoints[h2][t]['cell_ids'].index(L) or e == timepoints[h2][t]['cell_ids'].index(L)) and tracking[h1,h2,a,b,c,d,e].x:
-                                P = timepoints[h1][t-1]['cell_ids'][c]
-                                break
-                            elif a == -1 and b == t and tracking[h1,h2,a,b,c,d,e].x and e == timepoints[h2][t]['cell_ids'].index(L):
-                                P = 0
-                                break
-                            else:
-                                P = None
-                        line = line + str(P) + "\n"
-                        f.writelines(line)
+            canonical_frames.append(current_frame)
+        tracked_masks[frame_index + 1] = current_frame.label_image
+        persist_tracking_progress(
+            output_dir=output_dir,
+            config=config,
+            source_names=source_names,
+            frame_count=frame_count,
+            reference_shape=reference_shape,
+            completed_frame=frame_index + 1,
+            frame_mask=current_frame.label_image,
+            lineage_state=lineage_state,
+            next_track_id=next_track_id,
+        )
 
-    f.close()
+    return build_tracking_result(source_names, canonical_frames, tracked_masks, lineage_state)
+
+
+def maybe_resume_tracking(
+    config: TrackingConfig,
+    raw_frames: np.ndarray,
+    output_dir: Path,
+    source_names: tuple[str, ...],
+    frame_count: int,
+    reference_shape: tuple[int, int],
+) -> ResumeState | None:
+    if config.force_retrack:
+        LOGGER.info("Ignoring any saved tracking checkpoint because --force-retrack was requested.")
+        return None
+
+    checkpoint = projectio.load_tracking_checkpoint(output_dir)
+    if checkpoint is None:
+        LOGGER.info("No saved tracking checkpoint found; starting from frame 0.")
+        return None
+
+    if not checkpoint_matches(
+        checkpoint=checkpoint,
+        config=config,
+        source_names=source_names,
+        frame_count=frame_count,
+        reference_shape=reference_shape,
+    ):
+        LOGGER.info("Saved tracking checkpoint does not match the current run; starting from frame 0.")
+        return None
+
+    completed_frame = checkpoint.completed_frame
+    if completed_frame < 0 or completed_frame >= frame_count:
+        LOGGER.info("Saved tracking checkpoint has an invalid completed frame; starting from frame 0.")
+        return None
+
+    tracked_masks = np.zeros((frame_count, *reference_shape), dtype=np.uint16)
+    canonical_frames: list[FrameObjects] = []
+    for frame_index in range(completed_frame + 1):
+        mask = np.asarray(projectio.load_tracking_mask(output_dir, frame_index), dtype=np.uint16)
+        if tuple(mask.shape) != reference_shape:
+            raise ValueError(
+                f"Saved tracked mask for frame {frame_index} has shape {mask.shape}, expected {reference_shape}."
+            )
+        tracked_masks[frame_index] = mask
+        canonical_frames.append(projectio.build_frame_objects("tracked", frame_index, mask, raw_frames[frame_index]))
+
+    LOGGER.info("Resuming tracking from saved frame %03d.", completed_frame)
+    return ResumeState(
+        completed_frame=completed_frame,
+        canonical_frames=canonical_frames,
+        tracked_masks=tracked_masks,
+        lineage_state={
+            track_id: [begin, end, parent]
+            for track_id, (begin, end, parent) in checkpoint.lineage_state.items()
+        },
+        next_track_id=checkpoint.next_track_id,
+    )
+
+
+def checkpoint_matches(
+    checkpoint: TrackingCheckpoint,
+    config: TrackingConfig,
+    source_names: tuple[str, ...],
+    frame_count: int,
+    reference_shape: tuple[int, int],
+) -> bool:
+    return (
+        checkpoint.version == CHECKPOINT_VERSION
+        and checkpoint.dataset_root == str(config.dataset_root)
+        and checkpoint.track_sequence == config.track_sequence
+        and checkpoint.seg_source == config.seg_source
+        and checkpoint.selected_sources == source_names
+        and checkpoint.frame_count == frame_count
+        and checkpoint.frame_shape == reference_shape
+        and abs(checkpoint.max_distance - config.max_distance) < 1e-9
+        and abs(checkpoint.segmentation_reward - config.segmentation_reward) < 1e-9
+    )
+
+
+def persist_tracking_progress(
+    output_dir,
+    config: TrackingConfig,
+    source_names: tuple[str, ...],
+    frame_count: int,
+    reference_shape: tuple[int, int],
+    completed_frame: int,
+    frame_mask: np.ndarray,
+    lineage_state: dict[int, list[int]],
+    next_track_id: int,
+) -> None:
+    projectio.write_tracking_mask(output_dir, completed_frame, frame_mask)
+    projectio.write_lineage_rows(output_dir, lineage_rows_from_state(lineage_state))
+    projectio.write_tracking_checkpoint(
+        output_dir,
+        TrackingCheckpoint(
+            version=CHECKPOINT_VERSION,
+            dataset_root=str(config.dataset_root),
+            track_sequence=config.track_sequence,
+            seg_source=config.seg_source,
+            selected_sources=source_names,
+            frame_count=frame_count,
+            frame_shape=reference_shape,
+            completed_frame=completed_frame,
+            next_track_id=next_track_id,
+            max_distance=config.max_distance,
+            segmentation_reward=config.segmentation_reward,
+            lineage_state={
+                track_id: (begin, end, parent)
+                for track_id, (begin, end, parent) in lineage_state.items()
+            },
+        ),
+    )
+
+
+def build_tracking_result(
+    source_names: tuple[str, ...],
+    canonical_frames: list[FrameObjects],
+    tracked_masks: np.ndarray,
+    lineage_state: dict[int, list[int]],
+) -> TrackingResult:
+    lineage_rows = lineage_rows_from_state(lineage_state)
+    tracklets = build_tracklets(canonical_frames)
+    LOGGER.info(
+        "Decoded pairwise tracking with %s tracklet point(s) and %s lineage row(s).",
+        len(tracklets),
+        len(lineage_rows),
+    )
+    return TrackingResult(
+        selected_sources=source_names,
+        tracklets=tracklets,
+        lineage_rows=lineage_rows,
+        tracked_masks=tracked_masks,
+    )
+
+
+def lineage_rows_from_state(lineage_state: dict[int, list[int]]) -> tuple[LineageRecord, ...]:
+    return tuple(
+        LineageRecord(track_id=track_id, begin=begin, end=end, parent=parent)
+        for track_id, (begin, end, parent) in sorted(lineage_state.items())
+    )
+
+
+def initialize_first_frame(
+    config: TrackingConfig,
+    raw_frame: np.ndarray,
+    first_frames_by_source: dict[str, FrameObjects],
+) -> FrameObjects:
+    if len(first_frames_by_source) == 1:
+        source_name, frame = next(iter(first_frames_by_source.items()))
+        LOGGER.info(
+            "Initializing frame 0 directly from source '%s' with %s object(s).",
+            source_name,
+            frame.object_count,
+        )
+        selected_keys = [(source_name, object_index) for object_index in range(frame.object_count)]
+    else:
+        LOGGER.info(
+            "Initializing frame 0 from %s source(s) with overlap-aware hypothesis selection.",
+            len(first_frames_by_source),
+        )
+        selected_keys = select_initial_objects(config, first_frames_by_source)
+
+    selected_keys.sort(key=lambda key: object_sort_key(first_frames_by_source, key[0], key[1]))
+    assignments = [
+        (source_name, object_index, track_id)
+        for track_id, (source_name, object_index) in enumerate(selected_keys, start=1)
+    ]
+    mask = paint_track_mask(raw_frame.shape, first_frames_by_source, assignments)
+    return projectio.build_frame_objects("tracked", 0, mask, raw_frame)
+
+
+def select_initial_objects(
+    config: TrackingConfig,
+    first_frames_by_source: dict[str, FrameObjects],
+) -> list[tuple[str, int]]:
+    total_objects = sum(frame.object_count for frame in first_frames_by_source.values())
+    if total_objects == 0:
+        return []
+
+    model = gp.Model("PyTr2dInit")
+    model.Params.OutputFlag = 1
+    model.Params.LogToConsole = 1
+    if config.log_file is not None:
+        model.Params.LogFile = str(config.log_file)
+
+    activation_vars: dict[NextKey, gp.Var] = {}
+    objective_terms: list[gp.LinExpr] = []
+
+    for source_name, frame in first_frames_by_source.items():
+        for object_index in range(frame.object_count):
+            key = (source_name, object_index)
+            activation = model.addVar(vtype=GRB.BINARY, name=f"init[{source_name},{object_index}]")
+            activation_vars[key] = activation
+            objective_terms.append(config.segmentation_reward * activation)
+
+    overlap_constraint_count = 0
+    for source_name_1, source_name_2 in combinations(first_frames_by_source, 2):
+        frame_1 = first_frames_by_source[source_name_1]
+        frame_2 = first_frames_by_source[source_name_2]
+        for object_index_1, object_index_2 in overlapping_object_pairs(frame_1, frame_2):
+            model.addConstr(
+                activation_vars[(source_name_1, object_index_1)] + activation_vars[(source_name_2, object_index_2)] <= 1,
+                name=f"init_overlap[{source_name_1},{source_name_2},{object_index_1},{object_index_2}]",
+            )
+            overlap_constraint_count += 1
+
+    LOGGER.info(
+        "Frame 0 initialization ILP: activation=%s, overlap constraints=%s.",
+        len(activation_vars),
+        overlap_constraint_count,
+    )
+    model.setObjective(quicksum(objective_terms), GRB.MINIMIZE)
+    LOGGER.info("Starting Gurobi optimization for frame 0 initialization.")
+    model.optimize()
+    _assert_usable_status(model)
+
+    selected = [key for key, variable in activation_vars.items() if variable.X > 0.5]
+    LOGGER.info("Frame 0 initialization selected %s object(s).", len(selected))
+    return selected
+
+
+def solve_frame_pair(
+    config: TrackingConfig,
+    frame_index: int,
+    current_frame: FrameObjects,
+    next_frames: dict[str, FrameObjects],
+    next_raw_frame: np.ndarray,
+    scorers: EventScorers,
+    lineage_state: dict[int, list[int]],
+    next_track_id: int,
+) -> tuple[FrameObjects, int]:
+    next_object_count = sum(frame.object_count for frame in next_frames.values())
+    LOGGER.info(
+        "Solving pair %03d -> %03d with %s current track(s) and %s next candidate object(s).",
+        frame_index,
+        frame_index + 1,
+        current_frame.object_count,
+        next_object_count,
+    )
+    if current_frame.object_count == 0 and next_object_count == 0:
+        LOGGER.info("Pair %03d -> %03d is empty; carrying forward an empty tracked frame.", frame_index, frame_index + 1)
+        return projectio.build_frame_objects("tracked", frame_index + 1, np.zeros_like(next_raw_frame, dtype=np.uint16), next_raw_frame), next_track_id
+
+    model = gp.Model(f"PyTr2dPair_{frame_index:03d}_{frame_index + 1:03d}")
+    model.Params.OutputFlag = 1
+    model.Params.LogToConsole = 1
+    if config.log_file is not None:
+        model.Params.LogFile = str(config.log_file)
+
+    activation_vars: dict[NextKey, gp.Var] = {}
+    appearance_vars: dict[NextKey, gp.Var] = {}
+    disappearance_vars: dict[CurrentKey, gp.Var] = {}
+    move_vars: dict[MoveKey, gp.Var] = {}
+    division_vars: dict[DivisionKey, gp.Var] = {}
+    outgoing_terms: dict[CurrentKey, list[gp.Var]] = defaultdict(list)
+    incoming_terms: dict[NextKey, list[gp.Var]] = defaultdict(list)
+    objective_terms: list[gp.LinExpr] = []
+
+    candidate_maps = {
+        source_name: candidate_neighborhoods(current_frame, next_frame, config.max_distance)
+        for source_name, next_frame in next_frames.items()
+    }
+
+    for source_name, next_frame in next_frames.items():
+        for object_index in range(next_frame.object_count):
+            next_key = (source_name, object_index)
+            activation = model.addVar(vtype=GRB.BINARY, name=f"act[{source_name},{frame_index + 1},{object_index}]")
+            appearance = model.addVar(vtype=GRB.BINARY, name=f"app[{source_name},{frame_index + 1},{object_index}]")
+            activation_vars[next_key] = activation
+            appearance_vars[next_key] = appearance
+            objective_terms.append(config.segmentation_reward * activation)
+            objective_terms.append(scorers.appearance_cost(next_frame, object_index) * appearance)
+
+    for current_index in range(current_frame.object_count):
+        disappearance = model.addVar(vtype=GRB.BINARY, name=f"dis[{frame_index},{current_index}]")
+        disappearance_vars[current_index] = disappearance
+        objective_terms.append(scorers.disappearance_cost(current_frame, current_index) * disappearance)
+
+        for source_name, next_frame in next_frames.items():
+            candidate_indices = candidate_maps[source_name][current_index]
+            for next_index in candidate_indices:
+                move_key = (current_index, source_name, next_index)
+                move = model.addVar(
+                    vtype=GRB.BINARY,
+                    name=f"move[{frame_index},{current_index},{source_name},{next_index}]",
+                )
+                move_vars[move_key] = move
+                outgoing_terms[current_index].append(move)
+                incoming_terms[(source_name, next_index)].append(move)
+                objective_terms.append(scorers.move_cost(current_frame, current_index, next_frame, next_index) * move)
+
+            for child_index_1, child_index_2 in combinations(candidate_indices, 2):
+                division_key = (current_index, source_name, child_index_1, child_index_2)
+                division = model.addVar(
+                    vtype=GRB.BINARY,
+                    name=f"div[{frame_index},{current_index},{source_name},{child_index_1},{child_index_2}]",
+                )
+                division_vars[division_key] = division
+                outgoing_terms[current_index].append(division)
+                incoming_terms[(source_name, child_index_1)].append(division)
+                incoming_terms[(source_name, child_index_2)].append(division)
+                objective_terms.append(
+                    scorers.division_cost(current_frame, current_index, next_frame, child_index_1, child_index_2) * division
+                )
+
+    constraint_count = 0
+    for current_index in range(current_frame.object_count):
+        model.addConstr(
+            quicksum(outgoing_terms[current_index]) + disappearance_vars[current_index] == 1,
+            name=f"outgoing[{frame_index},{current_index}]",
+        )
+        constraint_count += 1
+
+    for next_key, activation in activation_vars.items():
+        model.addConstr(
+            quicksum(incoming_terms[next_key]) + appearance_vars[next_key] == activation,
+            name=f"incoming[{frame_index + 1},{next_key[0]},{next_key[1]}]",
+        )
+        constraint_count += 1
+
+    overlap_constraint_count = 0
+    for source_name_1, source_name_2 in combinations(next_frames, 2):
+        frame_1 = next_frames[source_name_1]
+        frame_2 = next_frames[source_name_2]
+        for object_index_1, object_index_2 in overlapping_object_pairs(frame_1, frame_2):
+            model.addConstr(
+                activation_vars[(source_name_1, object_index_1)] + activation_vars[(source_name_2, object_index_2)] <= 1,
+                name=f"overlap[{frame_index + 1},{source_name_1},{source_name_2},{object_index_1},{object_index_2}]",
+            )
+            overlap_constraint_count += 1
+
+    LOGGER.info(
+        "Pair %03d -> %03d ILP: activation=%s, appearance=%s, disappearance=%s, move=%s, division=%s, flow constraints=%s, overlap constraints=%s.",
+        frame_index,
+        frame_index + 1,
+        len(activation_vars),
+        len(appearance_vars),
+        len(disappearance_vars),
+        len(move_vars),
+        len(division_vars),
+        constraint_count,
+        overlap_constraint_count,
+    )
+    model.setObjective(quicksum(objective_terms), GRB.MINIMIZE)
+    LOGGER.info("Starting Gurobi optimization for pair %03d -> %03d.", frame_index, frame_index + 1)
+    model.optimize()
+    _assert_usable_status(model)
+    LOGGER.info(
+        "Finished pair %03d -> %03d optimization with status %s and objective %.6f.",
+        frame_index,
+        frame_index + 1,
+        model.Status,
+        float(model.ObjVal),
+    )
+
+    selected_appearances = {
+        next_key
+        for next_key, variable in appearance_vars.items()
+        if variable.X > 0.5
+    }
+    selected_disappearances = {
+        current_index
+        for current_index, variable in disappearance_vars.items()
+        if variable.X > 0.5
+    }
+    selected_moves = {
+        current_index: (source_name, next_index)
+        for (current_index, source_name, next_index), variable in move_vars.items()
+        if variable.X > 0.5
+    }
+    selected_divisions = {
+        current_index: ((source_name, child_index_1), (source_name, child_index_2))
+        for (current_index, source_name, child_index_1, child_index_2), variable in division_vars.items()
+        if variable.X > 0.5
+    }
+
+    assignments: list[tuple[str, int, int]] = []
+    next_key_to_track_id: dict[NextKey, int] = {}
+
+    for current_index in range(current_frame.object_count):
+        track_id = int(current_frame.raw_label_ids[current_index])
+        if current_index in selected_moves:
+            next_key = selected_moves[current_index]
+            next_key_to_track_id[next_key] = track_id
+            assignments.append((next_key[0], next_key[1], track_id))
+            lineage_state[track_id][1] = frame_index + 1
+
+        if current_index in selected_divisions:
+            child_keys = sorted(
+                selected_divisions[current_index],
+                key=lambda key: object_sort_key(next_frames, key[0], key[1]),
+            )
+            for child_key in child_keys:
+                child_track_id = next_track_id
+                next_track_id += 1
+                next_key_to_track_id[child_key] = child_track_id
+                assignments.append((child_key[0], child_key[1], child_track_id))
+                lineage_state[child_track_id] = [frame_index + 1, frame_index + 1, track_id]
+
+    for next_key in sorted(selected_appearances, key=lambda key: object_sort_key(next_frames, key[0], key[1])):
+        if next_key in next_key_to_track_id:
+            continue
+        track_id = next_track_id
+        next_track_id += 1
+        next_key_to_track_id[next_key] = track_id
+        assignments.append((next_key[0], next_key[1], track_id))
+        lineage_state[track_id] = [frame_index + 1, frame_index + 1, 0]
+
+    next_mask = paint_track_mask(next_raw_frame.shape, next_frames, assignments)
+    next_frame = projectio.build_frame_objects("tracked", frame_index + 1, next_mask, next_raw_frame)
+    LOGGER.info(
+        "Pair %03d -> %03d decoded: moves=%s, divisions=%s, appearances=%s, disappearances=%s, cumulative tracks=%s.",
+        frame_index,
+        frame_index + 1,
+        len(selected_moves),
+        len(selected_divisions),
+        len(selected_appearances),
+        len(selected_disappearances),
+        len(lineage_state),
+    )
+    return next_frame, next_track_id
+
+
+def build_tracklets(canonical_frames: list[FrameObjects]) -> tuple[tuple[int, int, float, float], ...]:
+    tracklets: list[tuple[int, int, float, float]] = []
+    for frame in canonical_frames:
+        for object_index, track_id in enumerate(frame.raw_label_ids):
+            centroid_row, centroid_col = frame.centroids[object_index]
+            tracklets.append((int(track_id), int(frame.frame_index), centroid_row, centroid_col))
+    tracklets.sort(key=lambda row: (row[0], row[1]))
+    return tuple(tracklets)
+
+
+def paint_track_mask(
+    shape: tuple[int, int],
+    frames_by_source: dict[str, FrameObjects],
+    assignments: list[tuple[str, int, int]],
+) -> np.ndarray:
+    mask = np.zeros(shape, dtype=np.uint16)
+    for source_name, object_index, track_id in assignments:
+        coords = frames_by_source[source_name].coords[object_index]
+        existing_labels = mask[coords[:, 0], coords[:, 1]]
+        conflicting_labels = existing_labels[(existing_labels != 0) & (existing_labels != track_id)]
+        if conflicting_labels.size > 0:
+            raise ValueError(
+                f"Overlapping assignments detected while painting track {track_id} from source '{source_name}'."
+            )
+        mask[coords[:, 0], coords[:, 1]] = np.uint16(track_id)
+    return mask
+
+
+def object_sort_key(
+    frames_by_source: dict[str, FrameObjects],
+    source_name: str,
+    object_index: int,
+) -> tuple[float, float, str, int]:
+    centroid_row, centroid_col = frames_by_source[source_name].centroids[object_index]
+    return (centroid_row, centroid_col, source_name, object_index)
+
+
+def overlapping_object_pairs(
+    frame_1: FrameObjects,
+    frame_2: FrameObjects,
+) -> set[tuple[int, int]]:
+    overlap_mask = (frame_1.label_image > 0) & (frame_2.label_image > 0)
+    if not np.any(overlap_mask):
+        return set()
+
+    overlap_pairs = np.stack(
+        [frame_1.label_image[overlap_mask], frame_2.label_image[overlap_mask]],
+        axis=1,
+    )
+    unique_pairs = np.unique(overlap_pairs, axis=0)
+    return {
+        (
+            frame_1.raw_label_to_index[int(raw_label_1)],
+            frame_2.raw_label_to_index[int(raw_label_2)],
+        )
+        for raw_label_1, raw_label_2 in unique_pairs
+    }
+
+
+def _assert_usable_status(model: gp.Model) -> None:
+    if model.Status not in {GRB.OPTIMAL, GRB.SUBOPTIMAL, GRB.TIME_LIMIT}:
+        raise RuntimeError(f"Gurobi failed to find a usable solution. Status code: {model.Status}")
+
+
+def _validate_frames(
+    raw_frames: np.ndarray,
+    frames_by_source: dict[str, list[FrameObjects]],
+    frame_count: int,
+    reference_shape: tuple[int, int],
+) -> None:
+    if raw_frames.ndim != 3:
+        raise ValueError(f"Expected raw_frames to be a 3D stack, found shape {raw_frames.shape}.")
+    for source_name, frames in frames_by_source.items():
+        if len(frames) != frame_count:
+            raise ValueError(f"Source '{source_name}' has {len(frames)} frames, expected {frame_count}.")
+        for frame in frames:
+            if frame.shape != reference_shape:
+                raise ValueError(
+                    f"Source '{source_name}' frame {frame.frame_index} has shape {frame.shape}, expected {reference_shape}."
+                )
