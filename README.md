@@ -13,7 +13,8 @@ The current code is designed around the `Fluo-N2DL-HeLa` dataset layout and uses
 - sequence `01` for training the event classifiers,
 - sequence `02` for tracking,
 - Gurobi for optimization,
-- random forests for event scoring.
+- random forests for event scoring,
+- optional official Cell Tracking Challenge evaluation through `py-ctcmetrics`.
 
 ## What The Project Does
 
@@ -32,6 +33,7 @@ This is the default mode.
 - It then performs **pairwise ILP tracking** between consecutive frames:
   - `(t, t+1)` for all frames in sequence `02`
 - It writes one tracked mask per frame and one lineage file.
+- It can also evaluate an already saved single-source result without retracking by using `--evaluate-only`.
 
 ### 2. `consensus` mode
 
@@ -55,6 +57,17 @@ It works as follows:
   - `stardist`
 
 The four consensus variants share the same lineage graph and differ only in how the fixed common tracklets are rendered geometrically.
+
+### 3. `--evaluate-only`
+
+This is not a separate `--mode`. It is a flag that changes what `single` or `consensus` mode does.
+
+- In `single` mode, it loads one already saved source result and recomputes only the metric files.
+- In `consensus` mode, it loads the already saved consensus variants and recomputes only the pre-merge, per-variant, and comparison metric files.
+- It skips:
+  - classifier loading and training,
+  - pairwise tracking ILPs,
+  - consensus/global ILP solving.
 
 ## Expected Data Layout
 
@@ -134,6 +147,7 @@ Core runtime dependencies are:
 - `scikit-learn`
 - `tifffile`
 - `tqdm`
+- `py-ctcmetrics`
 
 Install them in your preferred environment, for example with `uv` or `pip`.
 
@@ -175,6 +189,8 @@ uv run python main.py
   - used in `single` mode, defaults to `all`
 - `--consensus-sources SOURCE_1 SOURCE_2`
   - used in `consensus` mode, defaults to `embedseg stardist`
+- `--evaluate-only`
+  - skip tracking and recompute metrics only from saved outputs
 - `--agreement-iou-threshold`
   - used in `consensus` mode, defaults to `0.8`
 - `--max-distance`
@@ -289,6 +305,30 @@ uv run python main.py --mode single --seg-source embedseg
 uv run python main.py --mode single --seg-source all
 ```
 
+### Example: Evaluate Only A Saved `stardist` Result
+
+```bash
+uv run python main.py --seg-source stardist --evaluate-only
+```
+
+This means:
+
+- load the saved single-source result from `outputs/Fluo-N2DL-HeLa/02/stardist/`
+- do not retrack the sequence
+- recompute and rewrite `metrics.json` and `metrics.txt`
+
+### Example: Evaluate Only A Saved `embedseg` Result
+
+```bash
+uv run python main.py --seg-source embedseg --evaluate-only
+```
+
+This is the same evaluation-only workflow, but for the saved `embedseg` output directory:
+
+```text
+outputs/Fluo-N2DL-HeLa/02/embedseg/
+```
+
 ### How Single Mode Works
 
 - Frame `0` is initialized from the selected segmentation source.
@@ -394,6 +434,8 @@ Contains:
 
 - `mask000.tif`, `mask001.tif`, ...
 - `res_track.txt`
+- `metrics.json`
+- `metrics.txt`
 - `tracking_checkpoint.json`
 - `run.log`
 
@@ -432,7 +474,41 @@ Each variant folder contains:
 
 ## Evaluation Metrics
 
-PyTr2d reports two levels of evaluation in consensus mode.
+PyTr2d reports metrics in both `single` and `consensus` mode.
+
+### Official Cell Tracking Challenge Evaluation
+
+If `02_GT/TRA` exists and `ctc_evaluate` from `py-ctcmetrics` is available in the environment, PyTr2d also runs the official CTC-style evaluation after tracking or during `--evaluate-only`.
+
+The saved `ctc_evaluation` block can contain:
+
+- `Valid`
+- `DET`
+- `SEG`
+- `TRA`
+- `LNK`
+- `CT`
+- `TF`
+- `BC(0)`
+- `CCA`
+- derived `BIO`
+- derived `OP_CSB`
+- derived `OP_CTB`
+- derived `OP_CLB`
+
+If the tool is not installed, the code still writes the metrics files, but the `ctc_evaluation` block is marked as `skipped` with the reason.
+
+### Single-Mode Metrics
+
+For a saved single-source result, PyTr2d writes:
+
+- `summary_metrics`
+  - number of tracks
+  - number of divisions
+  - number of frames
+  - frame object count min/mean/max
+- `ctc_evaluation`
+  - official CTC metrics when available
 
 ### 1. Pre-Merge Metrics
 
@@ -468,11 +544,19 @@ If `02_GT/TRA` exists, PyTr2d also evaluates each input solution against GT usin
 - `BIO`
   - mean of `CT`, `TF`, and `BC(0)`
 
+In addition, each input solution now also gets a nested `ctc_evaluation` block in `premerge_metrics.*` when official CTC evaluation is available.
+
 ### 2. Final Variant Metrics
 
 For each final variant (`intersection`, `union`, `embedseg`, `stardist`), PyTr2d writes:
 
-- GT-based metrics if `02_GT` exists:
+- `summary_metrics`
+  - number of tracks
+  - number of divisions
+  - number of frames
+  - frame object count min/mean/max
+  - common tracklet coverage
+- `legacy_gt_metrics` if `02_GT` exists:
   - vertex precision
   - vertex recall
   - vertex F1
@@ -483,12 +567,8 @@ For each final variant (`intersection`, `union`, `embedseg`, `stardist`), PyTr2d
   - `TF`
   - `BC(0)`
   - `BIO`
-- summary metrics even without GT:
-  - number of tracks
-  - number of divisions
-  - number of frames
-  - frame object count min/mean/max
-  - common tracklet coverage
+- `ctc_evaluation`
+  - official CTC metrics when available
 
 The root-level `variant_comparison.*` files compare the four final variants side by side.
 
@@ -550,6 +630,53 @@ uv run python main.py --mode single --seg-source embedseg --force-retrack
 
 ```bash
 uv run python main.py --mode consensus --consensus-sources embedseg stardist
+```
+
+### Evaluate Only A Saved Consensus Result
+
+```bash
+uv run python main.py --mode consensus --consensus-sources embedseg stardist --evaluate-only
+```
+
+This means:
+
+- load the saved input source results from:
+  - `outputs/Fluo-N2DL-HeLa/02/embedseg/`
+  - `outputs/Fluo-N2DL-HeLa/02/stardist/`
+- load the saved consensus variants from:
+  - `outputs/Fluo-N2DL-HeLa/02/consensus_embedseg_stardist/`
+- do not rerun pairwise tracking
+- do not rerun the consensus/global ILP
+- recompute and rewrite:
+  - `premerge_metrics.json`
+  - `premerge_metrics.txt`
+  - each variant `metrics.json`
+  - each variant `metrics.txt`
+  - `variant_comparison.json`
+  - `variant_comparison.txt`
+
+### When To Use `--seg-source` In Evaluation-Only Mode
+
+`--seg-source` matters only in `single` mode.
+
+Examples:
+
+```bash
+uv run python main.py --seg-source stardist --evaluate-only
+uv run python main.py --seg-source embedseg --evaluate-only
+```
+
+These commands tell PyTr2d which saved single-source result directory to load:
+
+- `stardist` means:
+  - `outputs/Fluo-N2DL-HeLa/02/stardist/`
+- `embedseg` means:
+  - `outputs/Fluo-N2DL-HeLa/02/embedseg/`
+
+In `consensus` mode, `--seg-source` is not used. The relevant inputs are chosen through:
+
+```bash
+--consensus-sources embedseg stardist
 ```
 
 ## Testing

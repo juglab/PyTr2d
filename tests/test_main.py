@@ -7,9 +7,9 @@ from unittest import mock
 
 import numpy as np
 
-from main import _run_consensus_tracking, load_or_train_event_scorers
+from main import _run_consensus_tracking, load_or_train_event_scorers, run_tracking
 from tracking.random_forest import EventScorers, RandomForestEventTrainer, save_event_scorers
-from tracking.types import ConsensusResult, SavedTrackingSolution, TrackingConfig, VariantEvaluation
+from tracking.types import ConsensusResult, SavedTrackingSolution, TrackingConfig, TrackingResult, VariantEvaluation
 
 
 class ConstantProbabilityModel:
@@ -124,6 +124,64 @@ class ConsensusMainFlowTests(unittest.TestCase):
             appearance_model=ConstantProbabilityModel(positive_probability),
             disappearance_model=ConstantProbabilityModel(positive_probability),
         )
+
+
+class EvaluateOnlyRoutingTests(unittest.TestCase):
+    def test_single_evaluate_only_bypasses_scorer_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_root = Path(tmpdir) / "dataset"
+            dataset_root.mkdir()
+            config = TrackingConfig(
+                dataset_root=dataset_root,
+                extra_seg_root=None,
+                mode="single",
+                evaluate_only=True,
+                seg_source="stardist",
+            )
+            fake_result = TrackingResult(
+                selected_sources=("stardist",),
+                tracklets=(),
+                lineage_rows=(),
+                tracked_masks=np.zeros((1, 2, 2), dtype=np.uint16),
+            )
+
+            with mock.patch("main._evaluate_single_tracking", return_value=fake_result) as evaluate_single, \
+                 mock.patch("main.load_or_train_event_scorers") as load_scorers:
+                result = run_tracking(config)
+
+        self.assertIs(result, fake_result)
+        evaluate_single.assert_called_once_with(config)
+        load_scorers.assert_not_called()
+
+    def test_consensus_evaluate_only_bypasses_scorer_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dataset_root = Path(tmpdir) / "dataset"
+            dataset_root.mkdir()
+            config = TrackingConfig(
+                dataset_root=dataset_root,
+                extra_seg_root=None,
+                mode="consensus",
+                evaluate_only=True,
+                consensus_sources=("embedseg", "stardist"),
+            )
+            fake_result = ConsensusResult(
+                selected_sources=("embedseg", "stardist"),
+                lineage_rows=(),
+                output_dir=Path("/tmp/consensus"),
+                premerge_metrics_path=Path("/tmp/consensus/premerge_metrics.json"),
+                premerge_metrics_text_path=Path("/tmp/consensus/premerge_metrics.txt"),
+                variant_comparison_path=Path("/tmp/consensus/variant_comparison.json"),
+                variant_comparison_text_path=Path("/tmp/consensus/variant_comparison.txt"),
+                variant_evaluations={},
+            )
+
+            with mock.patch("main._evaluate_consensus_tracking", return_value=fake_result) as evaluate_consensus, \
+                 mock.patch("main.load_or_train_event_scorers") as load_scorers:
+                result = run_tracking(config)
+
+        self.assertIs(result, fake_result)
+        evaluate_consensus.assert_called_once_with(config)
+        load_scorers.assert_not_called()
 
 
 if __name__ == "__main__":

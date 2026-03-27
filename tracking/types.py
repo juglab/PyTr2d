@@ -13,6 +13,7 @@ class TrackingConfig:
     train_sequence: str = "01"
     track_sequence: str = "02"
     mode: str = "single"
+    evaluate_only: bool = False
     seg_source: str = "all"
     consensus_sources: tuple[str, ...] = ("embedseg", "stardist")
     agreement_iou_threshold: float = 0.8
@@ -89,9 +90,12 @@ class TrackingResult:
     tracklets: tuple[tuple[int, int, float, float], ...]
     lineage_rows: tuple[LineageRecord, ...]
     tracked_masks: np.ndarray
+    metrics: dict[str, object] = field(default_factory=dict)
     output_dir: Path | None = None
     mask_paths: tuple[Path, ...] = field(default_factory=tuple)
     lineage_path: Path | None = None
+    metrics_json_path: Path | None = None
+    metrics_text_path: Path | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -133,7 +137,7 @@ class HypothesisTracklet:
 @dataclass(slots=True, frozen=True)
 class ConsensusMetrics:
     agreement_metrics: dict[str, float]
-    input_solution_metrics: dict[str, dict[str, float]]
+    input_solution_metrics: dict[str, dict[str, object]]
     common_tracklet_count: int
     hypothesis_tracklet_count: int
 
@@ -141,7 +145,7 @@ class ConsensusMetrics:
 @dataclass(slots=True, frozen=True)
 class VariantEvaluation:
     variant_name: str
-    metrics: dict[str, float]
+    metrics: dict[str, object]
     output_dir: Path
     mask_paths: tuple[Path, ...]
     lineage_path: Path

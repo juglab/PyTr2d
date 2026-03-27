@@ -13,6 +13,8 @@ from gurobipy import GRB, quicksum
 from scipy.optimize import linear_sum_assignment
 
 from dataio import projectio
+from tracking import reporting
+from tracking.ctc_evaluation import evaluate_result_with_ctc, log_ctc_evaluation
 from tracking.random_forest import EventScorers, intersection_areas, probability_to_cost
 from tracking.types import (
     CommonTracklet,
@@ -116,8 +118,8 @@ def solve_consensus_tracking(
         "common_tracklet_count": preparation.input_metrics.common_tracklet_count,
         "hypothesis_tracklet_count": preparation.input_metrics.hypothesis_tracklet_count,
     }
-    write_json(premerge_json_path, premerge_payload)
-    write_text(premerge_text_path, format_metrics_report(premerge_payload))
+    reporting.write_json(premerge_json_path, premerge_payload)
+    reporting.write_text(premerge_text_path, reporting.format_metrics_report(premerge_payload))
     LOGGER.info("Wrote pre-merge metrics to %s and %s.", premerge_json_path, premerge_text_path)
 
     selected_nodes, incoming_choice, outgoing_choice = solve_global_tracklet_ilp(
@@ -132,75 +134,154 @@ def solve_consensus_tracking(
         incoming_choice=incoming_choice,
         outgoing_choice=outgoing_choice,
     )
+    return _finalize_consensus_outputs(
+        config=config,
+        raw_frames=raw_frames,
+        indexed_solutions=indexed_solutions,
+        preparation=preparation,
+        output_root=output_root,
+        source_names=source_names,
+        lineage_rows=lineage_rows,
+        tracked_masks_by_variant={
+            variant_name: render_variant_masks(
+                variant_name=variant_name,
+                raw_frames=raw_frames,
+                nodes=preparation.nodes,
+                selected_nodes=selected_nodes,
+                node_to_final_track=node_to_final_track,
+                indexed_solutions=indexed_solutions,
+            )
+            for variant_name in ("intersection", "union", source_names[0], source_names[1])
+        },
+        premerge_json_path=premerge_json_path,
+        premerge_text_path=premerge_text_path,
+        write_outputs=True,
+    )
 
-    gt_index: SolutionIndex | None = None
-    try:
-        gt_frames = projectio.load_gt_frame_objects(config.dataset_root, config.track_sequence, raw_frames)
-        gt_rows = tuple(projectio.load_lineage_records(config.dataset_root, config.track_sequence).values())
-        gt_solution = SavedTrackingSolution(
-            source_name="gt",
-            output_dir=config.dataset_root / f"{config.track_sequence}_GT" / "TRA",
-            tracked_masks=np.stack([frame.label_image.astype(np.uint16) for frame in gt_frames]),
-            lineage_rows=gt_rows,
-            frames=tuple(gt_frames),
-            checkpoint=None,
-        )
-        gt_index = build_solution_index(gt_solution)
-        LOGGER.info("Loaded GT tracking data for consensus evaluation.")
-    except ValueError:
-        LOGGER.info("No GT tracking data found for %s; consensus evaluation will use summary metrics only.", config.track_sequence)
 
-    variant_names = ("intersection", "union", source_names[0], source_names[1])
+def evaluate_saved_consensus_outputs(
+    config: TrackingConfig,
+    raw_frames: np.ndarray,
+    solutions_by_source: dict[str, SavedTrackingSolution],
+) -> ConsensusResult:
+    if len(solutions_by_source) != 2:
+        raise ValueError("Consensus evaluation currently expects exactly two saved source solutions.")
+
+    source_names = tuple(config.consensus_sources)
+    indexed_solutions = {name: build_solution_index(solution) for name, solution in solutions_by_source.items()}
+    LOGGER.info("Recomputing consensus pre-merge metrics from saved source solutions.")
+    preparation = prepare_consensus(config, indexed_solutions)
+    output_root = projectio.resolve_consensus_output_dir(config)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    premerge_json_path = output_root / "premerge_metrics.json"
+    premerge_text_path = output_root / "premerge_metrics.txt"
+    premerge_payload = {
+        "agreement_metrics": preparation.input_metrics.agreement_metrics,
+        "input_solution_metrics": preparation.input_metrics.input_solution_metrics,
+        "common_tracklet_count": preparation.input_metrics.common_tracklet_count,
+        "hypothesis_tracklet_count": preparation.input_metrics.hypothesis_tracklet_count,
+    }
+    reporting.write_json(premerge_json_path, premerge_payload)
+    reporting.write_text(premerge_text_path, reporting.format_metrics_report(premerge_payload))
+    LOGGER.info("Wrote pre-merge metrics to %s and %s.", premerge_json_path, premerge_text_path)
+
+    tracked_masks_by_variant: dict[str, np.ndarray] = {}
+    lineage_rows: tuple[LineageRecord, ...] | None = None
+    for variant_name in ("intersection", "union", source_names[0], source_names[1]):
+        variant_dir = output_root / variant_name
+        saved_variant = projectio.load_saved_tracking_solution(variant_name, variant_dir, raw_frames)
+        tracked_masks_by_variant[variant_name] = saved_variant.tracked_masks
+        if lineage_rows is None:
+            lineage_rows = saved_variant.lineage_rows
+        elif lineage_rows != saved_variant.lineage_rows:
+            raise ValueError(f"Saved consensus variant '{variant_name}' has lineage rows inconsistent with the other variants.")
+
+    if lineage_rows is None:
+        raise ValueError(f"No saved consensus variants were found under {output_root}.")
+
+    return _finalize_consensus_outputs(
+        config=config,
+        raw_frames=raw_frames,
+        indexed_solutions=indexed_solutions,
+        preparation=preparation,
+        output_root=output_root,
+        source_names=source_names,
+        lineage_rows=lineage_rows,
+        tracked_masks_by_variant=tracked_masks_by_variant,
+        premerge_json_path=premerge_json_path,
+        premerge_text_path=premerge_text_path,
+        write_outputs=False,
+    )
+
+
+def _finalize_consensus_outputs(
+    config: TrackingConfig,
+    raw_frames: np.ndarray,
+    indexed_solutions: dict[str, SolutionIndex],
+    preparation: ConsensusPreparation,
+    output_root: Path,
+    source_names: tuple[str, str],
+    lineage_rows: tuple[LineageRecord, ...],
+    tracked_masks_by_variant: dict[str, np.ndarray],
+    premerge_json_path: Path,
+    premerge_text_path: Path,
+    write_outputs: bool,
+) -> ConsensusResult:
+    gt_index = _load_gt_solution_index(config, raw_frames)
     variant_evaluations: dict[str, VariantEvaluation] = {}
-    comparison_payload: dict[str, dict[str, float]] = {}
+    comparison_payload: dict[str, dict[str, object]] = {}
+
+    node_lookup = {node.node_id: node for node in preparation.nodes}
     selected_common_nodes = {
         node_id
-        for node_id in selected_nodes
-        if preparation.nodes[node_id].fixed
+        for node_id in node_lookup
+        if node_lookup[node_id].fixed
     }
-    for variant_name in variant_names:
-        LOGGER.info("Rendering consensus variant '%s'.", variant_name)
-        tracked_masks = render_variant_masks(
-            variant_name=variant_name,
-            raw_frames=raw_frames,
-            nodes=preparation.nodes,
-            selected_nodes=selected_nodes,
-            node_to_final_track=node_to_final_track,
-            indexed_solutions=indexed_solutions,
-        )
+
+    for variant_name, tracked_masks in tracked_masks_by_variant.items():
         variant_dir = output_root / variant_name
-        mask_paths, lineage_path = projectio.write_tracking_outputs(variant_dir, tracked_masks, lineage_rows)
-        metrics = summarize_variant(
-            variant_name=variant_name,
-            tracked_masks=tracked_masks,
-            lineage_rows=lineage_rows,
-            common_tracklet_count=len(preparation.common_tracklets),
-            selected_common_tracklets=len(selected_common_nodes),
-        )
-        if gt_index is not None:
-            metrics.update(
-                evaluate_solution_against_gt(
-                    build_solution_index(
-                        SavedTrackingSolution(
-                            source_name=variant_name,
-                            output_dir=variant_dir,
-                            tracked_masks=tracked_masks,
-                            lineage_rows=lineage_rows,
-                            frames=tuple(
-                                projectio.build_frame_objects(variant_name, frame_index, mask, raw_frames[frame_index])
-                                for frame_index, mask in enumerate(tracked_masks)
-                            ),
-                            checkpoint=None,
-                        )
-                    ),
-                    gt_index,
-                    GT_EVAL_IOU_THRESHOLD,
-                )
+        if write_outputs:
+            mask_paths, lineage_path = projectio.write_tracking_outputs(variant_dir, tracked_masks, lineage_rows)
+        else:
+            mask_paths = tuple(variant_dir / f"mask{frame_index:03d}.tif" for frame_index in range(len(tracked_masks)))
+            lineage_path = variant_dir / "res_track.txt"
+        metrics: dict[str, object] = {
+            "summary_metrics": summarize_variant(
+                variant_name=variant_name,
+                tracked_masks=tracked_masks,
+                lineage_rows=lineage_rows,
+                common_tracklet_count=len(preparation.common_tracklets),
+                selected_common_tracklets=len(selected_common_nodes),
             )
+        }
+        if gt_index is not None:
+            metrics["legacy_gt_metrics"] = evaluate_solution_against_gt(
+                build_solution_index(
+                    SavedTrackingSolution(
+                        source_name=variant_name,
+                        output_dir=variant_dir,
+                        tracked_masks=tracked_masks,
+                        lineage_rows=lineage_rows,
+                        frames=tuple(
+                            projectio.build_frame_objects(variant_name, frame_index, mask, raw_frames[frame_index])
+                            for frame_index, mask in enumerate(tracked_masks)
+                        ),
+                        checkpoint=None,
+                    )
+                ),
+                gt_index,
+                GT_EVAL_IOU_THRESHOLD,
+            )
+        metrics["ctc_evaluation"] = evaluate_result_with_ctc(
+            config.dataset_root / f"{config.track_sequence}_GT",
+            variant_dir,
+        )
+        log_ctc_evaluation(f"Consensus variant '{variant_name}'", metrics["ctc_evaluation"])
         metrics_json_path = variant_dir / "metrics.json"
         metrics_text_path = variant_dir / "metrics.txt"
-        write_json(metrics_json_path, metrics)
-        write_text(metrics_text_path, format_metrics_report(metrics))
+        reporting.write_json(metrics_json_path, metrics)
+        reporting.write_text(metrics_text_path, reporting.format_metrics_report(metrics))
         comparison_payload[variant_name] = dict(metrics)
         variant_evaluations[variant_name] = VariantEvaluation(
             variant_name=variant_name,
@@ -211,12 +292,12 @@ def solve_consensus_tracking(
             metrics_json_path=metrics_json_path,
             metrics_text_path=metrics_text_path,
         )
-        LOGGER.info("Saved consensus variant '%s' to %s.", variant_name, variant_dir)
+        LOGGER.info("Saved consensus variant '%s' metrics to %s.", variant_name, variant_dir)
 
     comparison_json_path = output_root / "variant_comparison.json"
     comparison_text_path = output_root / "variant_comparison.txt"
-    write_json(comparison_json_path, comparison_payload)
-    write_text(comparison_text_path, format_metrics_report(comparison_payload))
+    reporting.write_json(comparison_json_path, comparison_payload)
+    reporting.write_text(comparison_text_path, reporting.format_metrics_report(comparison_payload))
     LOGGER.info("Wrote variant comparison metrics to %s and %s.", comparison_json_path, comparison_text_path)
 
     return ConsensusResult(
@@ -229,6 +310,28 @@ def solve_consensus_tracking(
         variant_comparison_text_path=comparison_text_path,
         variant_evaluations=variant_evaluations,
     )
+
+
+def _load_gt_solution_index(
+    config: TrackingConfig,
+    raw_frames: np.ndarray,
+) -> SolutionIndex | None:
+    try:
+        gt_frames = projectio.load_gt_frame_objects(config.dataset_root, config.track_sequence, raw_frames)
+        gt_rows = tuple(projectio.load_lineage_records(config.dataset_root, config.track_sequence).values())
+        gt_solution = SavedTrackingSolution(
+            source_name="gt",
+            output_dir=config.dataset_root / f"{config.track_sequence}_GT" / "TRA",
+            tracked_masks=np.stack([frame.label_image.astype(np.uint16) for frame in gt_frames]),
+            lineage_rows=gt_rows,
+            frames=tuple(gt_frames),
+            checkpoint=None,
+        )
+        LOGGER.info("Loaded GT tracking data for consensus evaluation.")
+        return build_solution_index(gt_solution)
+    except ValueError:
+        LOGGER.info("No GT tracking data found for %s; consensus evaluation will use summary metrics only.", config.track_sequence)
+        return None
 
 
 def build_solution_index(solution: SavedTrackingSolution) -> SolutionIndex:
@@ -481,11 +584,15 @@ def filter_conflicting_hypotheses(
     hypothesis_nodes: list[TrackletNode],
     indexed_solutions: dict[str, SolutionIndex],
 ) -> tuple[TrackletNode, ...]:
+    if not common_nodes:
+        return tuple(hypothesis_nodes)
+
+    fixed_union_occupancy = build_fixed_common_union_occupancy(common_nodes, indexed_solutions)
     kept: list[TrackletNode] = []
     for node in hypothesis_nodes:
-        if any(nodes_overlap(node, common_node, indexed_solutions) for common_node in common_nodes):
+        if overlaps_fixed_common_union(node, fixed_union_occupancy, indexed_solutions):
             LOGGER.info(
-                "Dropping hypothesis tracklet %s (%s track %s, %03d-%03d) because it conflicts with a fixed common tracklet.",
+                "Dropping hypothesis tracklet %s (%s track %s, %03d-%03d) because it conflicts with fixed common union geometry.",
                 node.node_id,
                 node.source_name,
                 node.source_track_id,
@@ -495,6 +602,37 @@ def filter_conflicting_hypotheses(
             continue
         kept.append(node)
     return tuple(kept)
+
+
+def build_fixed_common_union_occupancy(
+    common_nodes: list[TrackletNode],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> list[np.ndarray]:
+    sample_solution = next(iter(indexed_solutions.values())).solution
+    frame_count = len(sample_solution.frames)
+    frame_shape = sample_solution.frames[0].shape
+    occupancy = [np.zeros(frame_shape, dtype=bool) for _ in range(frame_count)]
+    for node in common_nodes:
+        for frame_index in range(node.begin, node.end + 1):
+            coords = node_variant_coords("union", node, frame_index, indexed_solutions)
+            if coords.size == 0:
+                continue
+            occupancy[frame_index][coords[:, 0], coords[:, 1]] = True
+    return occupancy
+
+
+def overlaps_fixed_common_union(
+    node: TrackletNode,
+    fixed_union_occupancy: list[np.ndarray],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> bool:
+    for frame_index in range(node.begin, node.end + 1):
+        coords = node_variant_coords("union", node, frame_index, indexed_solutions)
+        if coords.size == 0:
+            continue
+        if np.any(fixed_union_occupancy[frame_index][coords[:, 0], coords[:, 1]]):
+            return True
+    return False
 
 
 def solve_global_tracklet_ilp(
@@ -729,24 +867,87 @@ def render_variant_masks(
     indexed_solutions: dict[str, SolutionIndex],
 ) -> np.ndarray:
     tracked_masks = np.zeros((len(raw_frames), *raw_frames[0].shape), dtype=np.uint16)
-    for node in sorted(
-        (node for node in nodes if node.node_id in selected_nodes),
-        key=lambda item: (node_to_final_track[item.node_id], item.begin, item.node_id),
-    ):
+    selected_node_list = list(node for node in nodes if node.node_id in selected_nodes)
+    if variant_name == "union":
+        selected_node_list.sort(
+            key=lambda item: (
+                0 if item.fixed else 1,
+                node_to_final_track[item.node_id],
+                item.begin,
+                item.node_id,
+            )
+        )
+    else:
+        selected_node_list.sort(
+            key=lambda item: (node_to_final_track[item.node_id], item.begin, item.node_id)
+        )
+
+    for node in selected_node_list:
         track_id = node_to_final_track[node.node_id]
         for frame_index in range(node.begin, node.end + 1):
             coords = node_variant_coords(variant_name, node, frame_index, indexed_solutions)
             if coords.size == 0:
                 continue
             frame_mask = tracked_masks[frame_index]
-            existing_labels = frame_mask[coords[:, 0], coords[:, 1]]
-            conflicting = existing_labels[(existing_labels != 0) & (existing_labels != track_id)]
-            if conflicting.size > 0:
-                raise ValueError(
-                    f"Variant '{variant_name}' contains overlapping selected tracklets at frame {frame_index}."
-                )
+            coords = resolve_render_conflicts(
+                variant_name=variant_name,
+                node=node,
+                track_id=track_id,
+                frame_index=frame_index,
+                coords=coords,
+                frame_mask=frame_mask,
+                indexed_solutions=indexed_solutions,
+            )
+            if coords.size == 0:
+                continue
             frame_mask[coords[:, 0], coords[:, 1]] = np.uint16(track_id)
     return tracked_masks
+
+
+def resolve_render_conflicts(
+    variant_name: str,
+    node: TrackletNode,
+    track_id: int,
+    frame_index: int,
+    coords: np.ndarray,
+    frame_mask: np.ndarray,
+    indexed_solutions: dict[str, SolutionIndex],
+) -> np.ndarray:
+    existing_labels = frame_mask[coords[:, 0], coords[:, 1]]
+    available = (existing_labels == 0) | (existing_labels == track_id)
+    if np.all(available):
+        return coords
+
+    if variant_name == "union" and node.fixed:
+        clipped_coords = np.asarray(coords[available], dtype=np.int32)
+        clipped_pixels = int(np.count_nonzero(~available))
+        if clipped_coords.size > 0:
+            LOGGER.warning(
+                "Variant '%s' clipped %s pixel(s) from fixed common tracklet %s at frame %03d to avoid overlap.",
+                variant_name,
+                clipped_pixels,
+                node.node_id,
+                frame_index,
+            )
+            return clipped_coords
+
+        fallback_coords = node_variant_coords("intersection", node, frame_index, indexed_solutions)
+        if fallback_coords.size > 0:
+            fallback_existing = frame_mask[fallback_coords[:, 0], fallback_coords[:, 1]]
+            fallback_available = (fallback_existing == 0) | (fallback_existing == track_id)
+            fallback_coords = np.asarray(fallback_coords[fallback_available], dtype=np.int32)
+            if fallback_coords.size > 0:
+                LOGGER.warning(
+                    "Variant '%s' fell back to intersection geometry for fixed common tracklet %s at frame %03d because union geometry was fully occupied.",
+                    variant_name,
+                    node.node_id,
+                    frame_index,
+                )
+                return fallback_coords
+
+    raise ValueError(
+        f"Variant '{variant_name}' contains overlapping selected tracklets at frame {frame_index}."
+    )
 
 
 def summarize_variant(
@@ -772,7 +973,7 @@ def input_solution_metrics(
     indexed_solutions: dict[str, SolutionIndex],
     dataset_root: Path,
     track_sequence: str,
-) -> dict[str, dict[str, float]]:
+) -> dict[str, dict[str, object]]:
     raw_frames = None
     try:
         raw_frames = projectio.load_raw_sequence(dataset_root, track_sequence)
@@ -791,10 +992,18 @@ def input_solution_metrics(
     except ValueError:
         return {}
 
-    return {
-        source_name: evaluate_solution_against_gt(solution, gt_solution, GT_EVAL_IOU_THRESHOLD)
-        for source_name, solution in indexed_solutions.items()
-    }
+    metrics_by_source: dict[str, dict[str, object]] = {}
+    for source_name, solution in indexed_solutions.items():
+        ctc_payload = evaluate_result_with_ctc(
+            dataset_root / f"{track_sequence}_GT",
+            solution.solution.output_dir,
+        )
+        log_ctc_evaluation(f"Consensus input '{source_name}'", ctc_payload)
+        metrics_by_source[source_name] = {
+            "legacy_gt_metrics": evaluate_solution_against_gt(solution, gt_solution, GT_EVAL_IOU_THRESHOLD),
+            "ctc_evaluation": ctc_payload,
+        }
+    return metrics_by_source
 
 
 def agreement_metrics(

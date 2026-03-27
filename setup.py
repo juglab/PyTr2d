@@ -17,5 +17,6 @@ setup(
         "scikit-learn",
         "tifffile",
         "tqdm",
+        "py-ctcmetrics",
     ],
 )

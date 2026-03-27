@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Callable
 
 from dataio import projectio
-from tracking.consensus import solve_consensus_tracking
+from tracking.consensus import evaluate_saved_consensus_outputs, solve_consensus_tracking
+from tracking.ctc_evaluation import evaluate_result_with_ctc, log_ctc_evaluation
 from tracking.random_forest import (
     EventScorers,
     RandomForestEventTrainer,
@@ -14,6 +15,7 @@ from tracking.random_forest import (
     resolve_model_path,
     save_event_scorers,
 )
+from tracking.reporting import format_metrics_report, write_json, write_text
 from tracking.trackingsolver import solve_tracking
 from tracking.types import ConsensusResult, SavedTrackingSolution, TrackingConfig, TrackingResult
 
@@ -28,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="single",
         choices=("single", "consensus"),
         help="Run either the original single-source tracker or the new consensus merge mode.",
+    )
+    parser.add_argument(
+        "--evaluate-only",
+        action="store_true",
+        help="Skip tracking and recompute metrics only from saved outputs.",
     )
     parser.add_argument(
         "--dataset-root",
@@ -142,6 +149,7 @@ def args_to_config(args: argparse.Namespace) -> TrackingConfig:
         train_sequence=args.train_sequence,
         track_sequence=args.track_sequence,
         mode=args.mode,
+        evaluate_only=args.evaluate_only,
         seg_source=args.seg_source,
         consensus_sources=tuple(args.consensus_sources),
         agreement_iou_threshold=args.agreement_iou_threshold,
@@ -208,6 +216,7 @@ def run_tracking(config: TrackingConfig) -> TrackingResult | ConsensusResult:
     LOGGER.info("Starting tracking run.")
     LOGGER.info("Dataset root: %s", config.dataset_root)
     LOGGER.info("Run mode: %s", config.mode)
+    LOGGER.info("Evaluate only: %s", config.evaluate_only)
     LOGGER.info("Training sequence: %s | Tracking sequence: %s", config.train_sequence, config.track_sequence)
     if config.mode == "single":
         LOGGER.info("Segmentation source selection: %s", config.seg_source)
@@ -219,6 +228,11 @@ def run_tracking(config: TrackingConfig) -> TrackingResult | ConsensusResult:
     LOGGER.info("Model directory root: %s", config.model_dir if config.model_dir else Path("models"))
     LOGGER.info("Log file: %s", config.log_file)
     LOGGER.info("Force retrack: %s", config.force_retrack)
+
+    if config.evaluate_only:
+        if config.mode == "consensus":
+            return _evaluate_consensus_tracking(config)
+        return _evaluate_single_tracking(config)
 
     trainer = RandomForestEventTrainer(
         max_distance=config.max_distance,
@@ -261,15 +275,35 @@ def _run_single_tracking(
     output_dir = projectio.resolve_output_dir(config)
     LOGGER.info("Writing tracked masks and lineage output.")
     mask_paths, lineage_path = projectio.write_tracking_outputs(output_dir, result.tracked_masks, result.lineage_rows)
-    result.output_dir = output_dir
-    result.mask_paths = mask_paths
-    result.lineage_path = lineage_path
+    finalize_single_tracking_metrics(config, result, output_dir, mask_paths=mask_paths, lineage_path=lineage_path)
     LOGGER.info(
         "Tracking run completed: %s track rows, %s output masks.",
         len(result.lineage_rows),
         len(result.mask_paths),
     )
     return result
+
+
+def _evaluate_single_tracking(config: TrackingConfig) -> TrackingResult:
+    LOGGER.info("Running evaluation-only mode for saved single-source outputs.")
+    raw_frames = projectio.load_raw_sequence(config.dataset_root, config.track_sequence)
+    output_dir = projectio.resolve_output_dir(config)
+    result = projectio.load_saved_tracking_solution(config.seg_source, output_dir, raw_frames)
+    tracking_result = TrackingResult(
+        selected_sources=(config.seg_source,),
+        tracklets=(),
+        lineage_rows=result.lineage_rows,
+        tracked_masks=result.tracked_masks,
+    )
+    finalize_single_tracking_metrics(
+        config,
+        tracking_result,
+        output_dir,
+        mask_paths=tuple(output_dir / f"mask{frame_index:03d}.tif" for frame_index in range(len(result.tracked_masks))),
+        lineage_path=output_dir / "res_track.txt",
+    )
+    LOGGER.info("Finished evaluation-only mode for %s.", output_dir)
+    return tracking_result
 
 
 def _run_consensus_tracking(
@@ -322,6 +356,30 @@ def _run_consensus_tracking(
     return solve_consensus_tracking(config, raw_frames, solutions_by_source, scorers)
 
 
+def _evaluate_consensus_tracking(config: TrackingConfig) -> ConsensusResult:
+    LOGGER.info("Running evaluation-only mode for saved consensus outputs.")
+    forbidden_sources = {"st", "err_seg", "gt"}
+    invalid_sources = sorted(source for source in config.consensus_sources if source in forbidden_sources)
+    if invalid_sources:
+        raise ValueError(f"Consensus mode only supports external source results. Invalid sources: {', '.join(invalid_sources)}")
+
+    raw_frames = projectio.load_raw_sequence(config.dataset_root, config.track_sequence)
+    frame_count = len(raw_frames)
+    solutions_by_source: dict[str, SavedTrackingSolution] = {}
+    for source_name in config.consensus_sources:
+        source_output_dir = projectio.resolve_source_output_dir(config.dataset_root, config.track_sequence, source_name)
+        if not projectio.is_saved_tracking_complete(source_output_dir, frame_count):
+            raise ValueError(
+                f"Saved consensus input '{source_name}' is incomplete under {source_output_dir}. "
+                "Run the tracker first without --evaluate-only."
+            )
+        solutions_by_source[source_name] = projectio.load_saved_tracking_solution(source_name, source_output_dir, raw_frames)
+
+    result = evaluate_saved_consensus_outputs(config, raw_frames, solutions_by_source)
+    LOGGER.info("Finished evaluation-only mode for consensus outputs in %s.", result.output_dir)
+    return result
+
+
 def _fit_event_scorers(
     config: TrackingConfig,
     trainer: RandomForestEventTrainer,
@@ -356,6 +414,47 @@ def _fit_event_scorers(
     return trainer.fit(training_frames_by_source, gt_frames, lineage_records)
 
 
+def summarize_tracking_result(result: TrackingResult) -> dict[str, float]:
+    object_counts = [int(len(set(frame[frame > 0].tolist()))) for frame in result.tracked_masks]
+    return {
+        "track_count": float(len(result.lineage_rows)),
+        "division_count": float(sum(1 for row in result.lineage_rows if row.parent > 0)),
+        "frame_count": float(len(result.tracked_masks)),
+        "frame_object_count_min": float(min(object_counts) if object_counts else 0),
+        "frame_object_count_mean": float(sum(object_counts) / len(object_counts) if object_counts else 0.0),
+        "frame_object_count_max": float(max(object_counts) if object_counts else 0),
+    }
+
+
+def finalize_single_tracking_metrics(
+    config: TrackingConfig,
+    result: TrackingResult,
+    output_dir: Path,
+    *,
+    mask_paths: tuple[Path, ...],
+    lineage_path: Path,
+) -> None:
+    result.output_dir = output_dir
+    result.mask_paths = mask_paths
+    result.lineage_path = lineage_path
+    metrics_payload = {
+        "summary_metrics": summarize_tracking_result(result),
+        "ctc_evaluation": evaluate_result_with_ctc(
+            config.dataset_root / f"{config.track_sequence}_GT",
+            output_dir,
+        ),
+    }
+    log_ctc_evaluation("Single-source result", metrics_payload["ctc_evaluation"])
+    metrics_json_path = output_dir / "metrics.json"
+    metrics_text_path = output_dir / "metrics.txt"
+    write_json(metrics_json_path, metrics_payload)
+    write_text(metrics_text_path, format_metrics_report(metrics_payload))
+    result.metrics = metrics_payload
+    result.metrics_json_path = metrics_json_path
+    result.metrics_text_path = metrics_text_path
+    LOGGER.info("Wrote tracking metrics to %s and %s.", metrics_json_path, metrics_text_path)
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -372,6 +471,7 @@ def main() -> int:
     else:
         print(f"Wrote {len(result.mask_paths)} masks to {result.output_dir}")
         print(f"Wrote lineage file to {result.lineage_path}")
+        print(f"Wrote metrics to {result.metrics_json_path}")
     print(f"Wrote run log to {config.log_file}")
     return 0
 
