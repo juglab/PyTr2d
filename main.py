@@ -466,6 +466,8 @@ def main() -> int:
         print(f"Wrote consensus outputs to {result.output_dir}")
         print(f"Wrote pre-merge metrics to {result.premerge_metrics_path}")
         print(f"Wrote variant comparison to {result.variant_comparison_path}")
+        if result.diagnostics_path is not None:
+            print(f"Wrote consensus diagnostics to {result.diagnostics_path}")
         for variant_name, evaluation in sorted(result.variant_evaluations.items()):
             print(f"Variant {variant_name}: {len(evaluation.mask_paths)} masks, lineage {evaluation.lineage_path}, metrics {evaluation.metrics_json_path}")
     else:

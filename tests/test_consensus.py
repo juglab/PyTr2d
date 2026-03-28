@@ -10,11 +10,17 @@ import numpy as np
 from dataio.projectio import build_frame_objects
 from tracking.consensus import (
     ConsensusPreparation,
+    ContinuationCandidate,
     ObjectStats,
     TrackletNode,
     build_solution_index,
+    build_continuation_candidates,
+    ctc_metric_deltas,
     filter_conflicting_hypotheses,
+    candidate_oracle_metrics,
+    gt_matches_for_nodes,
     render_variant_masks,
+    summarize_fragment_graph,
     solve_consensus_tracking,
 )
 from tracking.random_forest import EventScorers
@@ -419,6 +425,295 @@ class ConsensusSolverTests(unittest.TestCase):
         self.assertEqual(int(tracked_masks[0, 1, 1]), 1)
         self.assertEqual(int(tracked_masks[0, 1, 2]), 2)
         self.assertEqual(sorted(np.unique(tracked_masks[0][tracked_masks[0] > 0]).tolist()), [1, 2])
+
+    def test_small_boundary_overlap_yields_tolerated_handoff_candidate(self) -> None:
+        raw_frames = np.stack([np.ones((8, 12), dtype=np.uint16) for _ in range(2)])
+        embedseg_masks = np.stack(
+            [
+                np.array(
+                    [
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    ],
+                    dtype=np.uint16,
+                ),
+                np.array(
+                    [
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    ],
+                    dtype=np.uint16,
+                ),
+            ]
+        )
+        stardist_masks = np.stack(
+            [
+                np.array(
+                    [
+                        [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    ],
+                    dtype=np.uint16,
+                ),
+                np.array(
+                    [
+                        [0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    ],
+                    dtype=np.uint16,
+                ),
+            ]
+        )
+        embedseg_solution = SavedTrackingSolution(
+            source_name="embedseg",
+            output_dir=Path("/tmp/embedseg"),
+            tracked_masks=embedseg_masks,
+            lineage_rows=(self._row(track_id=1, begin=0, end=1, parent=0),),
+            frames=tuple(
+                build_frame_objects("embedseg", frame_index, mask, raw_frames[frame_index])
+                for frame_index, mask in enumerate(embedseg_masks)
+            ),
+            checkpoint=None,
+        )
+        stardist_solution = SavedTrackingSolution(
+            source_name="stardist",
+            output_dir=Path("/tmp/stardist"),
+            tracked_masks=stardist_masks,
+            lineage_rows=(self._row(track_id=1, begin=0, end=1, parent=0),),
+            frames=tuple(
+                build_frame_objects("stardist", frame_index, mask, raw_frames[frame_index])
+                for frame_index, mask in enumerate(stardist_masks)
+            ),
+            checkpoint=None,
+        )
+        indexed = {
+            "embedseg": build_solution_index(embedseg_solution),
+            "stardist": build_solution_index(stardist_solution),
+        }
+        nodes = (
+            TrackletNode(
+                node_id=0,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=1,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(2.0, 3.0, 25.0, 0.0, 1.0),
+                end_stats=ObjectStats(2.0, 3.0, 25.0, 0.0, 1.0),
+            ),
+            TrackletNode(
+                node_id=1,
+                begin=0,
+                end=1,
+                fixed=False,
+                kind="source_specific",
+                source_name="stardist",
+                source_track_id=1,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(2.0, 7.2, 21.0, 0.0, 1.0),
+                end_stats=ObjectStats(2.0, 7.2, 21.0, 0.0, 1.0),
+            ),
+        )
+        config = TrackingConfig(dataset_root=Path("/tmp/dataset"), extra_seg_root=None, max_distance=10.0)
+
+        candidates = build_continuation_candidates(config, nodes, indexed)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertTrue(candidates[0].is_tolerated_handoff)
+        self.assertEqual(candidates[0].shared_boundary_frame, 0)
+
+    def test_summary_graph_counts_tolerated_and_conflicts(self) -> None:
+        nodes = (
+            TrackletNode(
+                node_id=0,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="common_supported",
+                source_name=None,
+                source_track_id=None,
+                source_names=("embedseg", "stardist"),
+                source_track_ids=(1, 1),
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                mean_iou=0.9,
+                agreement_strength=0.9,
+            ),
+            TrackletNode(
+                node_id=1,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=1,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+            ),
+        )
+        stats = summarize_fragment_graph(
+            nodes=nodes,
+            continuation_candidates=(
+                ContinuationCandidate(parent_id=0, child_id=1, shared_boundary_frame=0, overlap_pixels=1, overlap_fraction=0.05),
+            ),
+            division_candidates=((0, 1, 1),),
+            hard_conflicts=(frozenset((0, 1)),),
+        )
+
+        self.assertEqual(stats["common_supported_fragment_count"], 1)
+        self.assertEqual(stats["source_specific_fragment_count"], 1)
+        self.assertEqual(stats["tolerated_handoff_pair_count"], 1)
+        self.assertEqual(stats["hard_conflict_count"], 1)
+
+    def test_ctc_metric_deltas_are_computed_against_best_input(self) -> None:
+        input_metrics = {
+            "embedseg": {"ctc_evaluation": {"metrics": {"TRA": 0.95, "DET": 0.9}}},
+            "stardist": {"ctc_evaluation": {"metrics": {"TRA": 0.92, "DET": 0.88}}},
+        }
+
+        deltas = ctc_metric_deltas(
+            variant_ctc_payload={"metrics": {"TRA": 0.97, "DET": 0.91}},
+            best_input_tra=0.95,
+            best_input_source="embedseg",
+            input_solution_metrics=input_metrics,
+        )
+
+        self.assertAlmostEqual(deltas["TRA"], 0.02)
+        self.assertAlmostEqual(deltas["DET"], 0.01)
+        self.assertAlmostEqual(deltas["delta_to_best_TRA"], 0.02)
+
+    def test_gt_matches_for_nodes_uses_only_overlapping_gt_labels(self) -> None:
+        raw_frames = np.stack([np.ones((5, 5), dtype=np.uint16)])
+        solution = SavedTrackingSolution(
+            source_name="embedseg",
+            output_dir=Path("/tmp/embedseg"),
+            tracked_masks=np.stack(
+                [
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0],
+                            [0, 1, 1, 0, 0],
+                            [0, 1, 1, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    )
+                ]
+            ),
+            lineage_rows=(self._row(track_id=1, begin=0, end=0, parent=0),),
+            frames=(
+                build_frame_objects(
+                    "embedseg",
+                    0,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0],
+                            [0, 1, 1, 0, 0],
+                            [0, 1, 1, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[0],
+                ),
+            ),
+            checkpoint=None,
+        )
+        gt_solution = SavedTrackingSolution(
+            source_name="gt",
+            output_dir=Path("/tmp/gt"),
+            tracked_masks=np.stack(
+                [
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0],
+                            [0, 1, 1, 2, 0],
+                            [0, 1, 1, 2, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    )
+                ]
+            ),
+            lineage_rows=(
+                self._row(track_id=1, begin=0, end=0, parent=0),
+                self._row(track_id=2, begin=0, end=0, parent=0),
+            ),
+            frames=(
+                build_frame_objects(
+                    "gt",
+                    0,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0],
+                            [0, 1, 1, 2, 0],
+                            [0, 1, 1, 2, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[0],
+                ),
+            ),
+            checkpoint=None,
+        )
+        indexed = {"embedseg": build_solution_index(solution)}
+        gt_indexed = build_solution_index(gt_solution)
+        nodes = (
+            TrackletNode(
+                node_id=0,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=1,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(1.5, 1.5, 4.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 1.5, 4.0, 0.0, 1.0),
+            ),
+        )
+
+        matches = gt_matches_for_nodes(nodes, indexed, gt_indexed, 0.5)
+
+        self.assertIn(1, matches[0])
+        self.assertEqual(matches[0][1], {0})
+        self.assertNotIn(2, matches[0])
 
     def _solution(
         self,

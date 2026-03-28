@@ -163,3 +163,5 @@ class ConsensusResult:
     variant_comparison_path: Path
     variant_comparison_text_path: Path
     variant_evaluations: dict[str, VariantEvaluation]
+    diagnostics_path: Path | None = None
+    diagnostics_text_path: Path | None = None
