@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import combinations
+import json
 import logging
 from pathlib import Path
 import sys
@@ -50,6 +51,13 @@ HANDOFF_OVERLAP_ABSOLUTE_PIXELS = 5
 HANDOFF_OVERLAP_RELATIVE_FRACTION = 0.05
 PROGRESS_LOG_STEPS = 20
 PROGRESS_LOG_FALLBACK_EVERY = 250
+RENDER_MANIFEST_FILENAME = "render_manifest.json"
+GEOMETRY_ASSIGNMENTS_FILENAME = "geometry_assignments.json"
+POSTHOC_GEOMETRY_MODE = "posthoc"
+TWO_STAGE_GEOMETRY_MODE = "two_stage"
+JOINT_GEOMETRY_MODE = "joint"
+OPTIMIZED_TWO_STAGE_VARIANT = "optimized_two_stage"
+OPTIMIZED_JOINT_VARIANT = "optimized_joint"
 
 
 @dataclass(slots=True)
@@ -141,6 +149,13 @@ def progress_iter(
 
 def log_consensus_stage(stage_number: int, stage_total: int, message: str) -> None:
     LOGGER.info("Consensus prep %s/%s: %s", stage_number, stage_total, message)
+
+
+def _assert_usable_status(model: gp.Model) -> None:
+    if GRB is None:
+        raise RuntimeError("Gurobi is unavailable.")
+    if model.Status not in {GRB.OPTIMAL, GRB.SUBOPTIMAL, GRB.TIME_LIMIT}:
+        raise RuntimeError(f"Gurobi failed to find a usable solution. Status code: {model.Status}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -241,6 +256,145 @@ class FragmentDiagnostics:
     variant_deltas_to_best_input: dict[str, dict[str, float]]
 
 
+@dataclass(slots=True, frozen=True)
+class GeometryOptimizationResult:
+    variant_name: str
+    common_geometry_assignments: dict[int, str]
+    diagnostics: dict[str, object]
+
+
+@dataclass(slots=True)
+class GeometryQueryCache:
+    coords_by_key: dict[tuple[int, str, int], np.ndarray] = field(default_factory=dict)
+    bbox_by_key: dict[tuple[int, str, int], tuple[int, int, int, int] | None] = field(default_factory=dict)
+    coord_set_by_key: dict[tuple[int, str, int], frozenset[tuple[int, int]]] = field(default_factory=dict)
+
+
+def default_consensus_variant_names(source_names: tuple[str, str]) -> tuple[str, ...]:
+    return ("intersection", "union", source_names[0], source_names[1])
+
+
+def geometry_option_names(source_names: tuple[str, str]) -> tuple[str, ...]:
+    return (source_names[0], source_names[1], "intersection", "union")
+
+
+def optimized_variant_name(common_geometry_mode: str) -> str:
+    if common_geometry_mode == TWO_STAGE_GEOMETRY_MODE:
+        return OPTIMIZED_TWO_STAGE_VARIANT
+    if common_geometry_mode == JOINT_GEOMETRY_MODE:
+        return OPTIMIZED_JOINT_VARIANT
+    raise ValueError(f"Optimized geometry mode expected, found '{common_geometry_mode}'.")
+
+
+def render_manifest_path(output_root: Path) -> Path:
+    return output_root / RENDER_MANIFEST_FILENAME
+
+
+def geometry_assignments_path(output_root: Path) -> Path:
+    return output_root / GEOMETRY_ASSIGNMENTS_FILENAME
+
+
+def build_render_manifest(
+    config: TrackingConfig,
+    variant_names: tuple[str, ...],
+    geometry_assignments_filename: str | None = None,
+) -> dict[str, object]:
+    return {
+        "common_geometry_mode": config.common_geometry_mode,
+        "variant_names": list(variant_names),
+        "consensus_sources": list(config.consensus_sources),
+        "geometry_source_weight": float(config.geometry_source_weight),
+        "geometry_temporal_overlap_weight": float(config.geometry_temporal_overlap_weight),
+        "geometry_neighbor_radius": int(config.geometry_neighbor_radius),
+        "geometry_assignments_filename": geometry_assignments_filename,
+    }
+
+
+def write_render_manifest(
+    output_root: Path,
+    payload: dict[str, object],
+) -> Path:
+    path = render_manifest_path(output_root)
+    reporting.write_json(path, payload)
+    return path
+
+
+def load_render_manifest(output_root: Path) -> dict[str, object] | None:
+    path = render_manifest_path(output_root)
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid render manifest structure in {path}.")
+    return payload
+
+
+def render_variant_names_from_manifest(
+    manifest: dict[str, object] | None,
+    source_names: tuple[str, str],
+) -> tuple[str, ...]:
+    if manifest is None:
+        return default_consensus_variant_names(source_names)
+    variant_names = manifest.get("variant_names")
+    if isinstance(variant_names, list) and all(isinstance(value, str) for value in variant_names):
+        return tuple(str(value) for value in variant_names)
+    return default_consensus_variant_names(source_names)
+
+
+def saved_geometry_assignments_path(
+    output_root: Path,
+    manifest: dict[str, object] | None,
+) -> Path | None:
+    if manifest is None:
+        return None
+    filename = manifest.get("geometry_assignments_filename")
+    if isinstance(filename, str) and filename:
+        return output_root / filename
+    return None
+
+
+def load_saved_variant_geometry_metrics(
+    output_root: Path,
+    variant_names: tuple[str, ...],
+) -> dict[str, dict[str, object]]:
+    payloads: dict[str, dict[str, object]] = {}
+    for variant_name in variant_names:
+        metrics_path = output_root / variant_name / "metrics.json"
+        if not metrics_path.exists():
+            continue
+        with metrics_path.open("r", encoding="utf-8") as handle:
+            metrics = json.load(handle)
+        if isinstance(metrics, dict):
+            optimized_geometry = metrics.get("optimized_geometry")
+            if isinstance(optimized_geometry, dict):
+                payloads[variant_name] = optimized_geometry
+    return payloads
+
+
+def geometry_support(option_name: str, source_names: tuple[str, str]) -> frozenset[str]:
+    if option_name == "intersection" or option_name == "union":
+        return frozenset(source_names)
+    if option_name == source_names[0]:
+        return frozenset((source_names[0],))
+    if option_name == source_names[1]:
+        return frozenset((source_names[1],))
+    raise ValueError(f"Unknown geometry option '{option_name}'.")
+
+
+def geometry_source_agreement(
+    left_option: str,
+    right_option: str,
+    source_names: tuple[str, str],
+) -> float:
+    left_support = geometry_support(left_option, source_names)
+    right_support = geometry_support(right_option, source_names)
+    union = left_support | right_support
+    if not union:
+        return 1.0
+    return float(len(left_support & right_support) / len(union))
+
+
 def solve_consensus_tracking(
     config: TrackingConfig,
     raw_frames: np.ndarray,
@@ -281,32 +435,60 @@ def solve_consensus_tracking(
     reporting.write_text(premerge_text_path, reporting.format_metrics_report(premerge_payload))
     LOGGER.info("Wrote pre-merge metrics to %s and %s.", premerge_json_path, premerge_text_path)
 
-    solver_result = solve_global_tracklet_ilp(
-        config=config,
-        preparation=preparation,
-        indexed_solutions=indexed_solutions,
-        scorers=scorers,
-    )
-    if len(solver_result) == 3:
-        selected_nodes, incoming_choice, outgoing_choice = solver_result
-        selected_graph_stats = {}
+    geometry_result: GeometryOptimizationResult | None = None
+    if config.common_geometry_mode == JOINT_GEOMETRY_MODE:
+        (
+            selected_nodes,
+            incoming_choice,
+            outgoing_choice,
+            selected_graph_stats,
+            common_geometry_assignments,
+            geometry_diagnostics,
+        ) = solve_joint_tracklet_geometry_ilp(
+            config=config,
+            preparation=preparation,
+            indexed_solutions=indexed_solutions,
+            scorers=scorers,
+        )
+        geometry_result = GeometryOptimizationResult(
+            variant_name=optimized_variant_name(config.common_geometry_mode),
+            common_geometry_assignments=common_geometry_assignments,
+            diagnostics=geometry_diagnostics,
+        )
     else:
-        selected_nodes, incoming_choice, outgoing_choice, selected_graph_stats = solver_result
+        solver_result = solve_global_tracklet_ilp(
+            config=config,
+            preparation=preparation,
+            indexed_solutions=indexed_solutions,
+            scorers=scorers,
+        )
+        if len(solver_result) == 3:
+            selected_nodes, incoming_choice, outgoing_choice = solver_result
+            selected_graph_stats = {}
+        else:
+            selected_nodes, incoming_choice, outgoing_choice, selected_graph_stats = solver_result
     lineage_rows, node_to_final_track = decode_selected_tracklets(
         nodes=preparation.nodes,
         selected_nodes=selected_nodes,
         incoming_choice=incoming_choice,
         outgoing_choice=outgoing_choice,
     )
-    return _finalize_consensus_outputs(
-        config=config,
-        raw_frames=raw_frames,
-        indexed_solutions=indexed_solutions,
-        preparation=preparation,
-        output_root=output_root,
-        source_names=source_names,
-        lineage_rows=lineage_rows,
-        tracked_masks_by_variant={
+
+    if config.common_geometry_mode == TWO_STAGE_GEOMETRY_MODE:
+        geometry_result = solve_two_stage_geometry_ilp(
+            config=config,
+            preparation=preparation,
+            indexed_solutions=indexed_solutions,
+            selected_nodes=selected_nodes,
+            incoming_choice=incoming_choice,
+            outgoing_choice=outgoing_choice,
+        )
+
+    tracked_masks_by_variant: dict[str, np.ndarray]
+    optimized_geometry_payloads: dict[str, dict[str, object]] = {}
+    geometry_assignments_json_path: Path | None = None
+    if geometry_result is None:
+        tracked_masks_by_variant = {
             variant_name: render_variant_masks(
                 variant_name=variant_name,
                 raw_frames=raw_frames,
@@ -315,8 +497,52 @@ def solve_consensus_tracking(
                 node_to_final_track=node_to_final_track,
                 indexed_solutions=indexed_solutions,
             )
-            for variant_name in ("intersection", "union", source_names[0], source_names[1])
-        },
+            for variant_name in default_consensus_variant_names(source_names)
+        }
+    else:
+        tracked_masks_by_variant = {
+            geometry_result.variant_name: render_variant_masks(
+                variant_name=geometry_result.variant_name,
+                raw_frames=raw_frames,
+                nodes=preparation.nodes,
+                selected_nodes=selected_nodes,
+                node_to_final_track=node_to_final_track,
+                indexed_solutions=indexed_solutions,
+                common_geometry_assignments=geometry_result.common_geometry_assignments,
+            )
+        }
+        optimized_geometry_payloads[geometry_result.variant_name] = geometry_result.diagnostics
+        geometry_assignments_json_path = geometry_assignments_path(output_root)
+        reporting.write_json(
+            geometry_assignments_json_path,
+            {
+                "common_geometry_mode": config.common_geometry_mode,
+                "assignments": {
+                    str(node_id): option_name
+                    for node_id, option_name in sorted(geometry_result.common_geometry_assignments.items())
+                },
+                "diagnostics": geometry_result.diagnostics,
+            },
+        )
+        LOGGER.info("Wrote geometry assignments to %s.", geometry_assignments_json_path)
+
+    variant_names = tuple(tracked_masks_by_variant)
+    render_manifest = build_render_manifest(
+        config=config,
+        variant_names=variant_names,
+        geometry_assignments_filename=geometry_assignments_json_path.name if geometry_assignments_json_path is not None else None,
+    )
+    manifest_output_path = write_render_manifest(output_root, render_manifest)
+    LOGGER.info("Wrote render manifest to %s.", manifest_output_path)
+    return _finalize_consensus_outputs(
+        config=config,
+        raw_frames=raw_frames,
+        indexed_solutions=indexed_solutions,
+        preparation=preparation,
+        output_root=output_root,
+        source_names=source_names,
+        lineage_rows=lineage_rows,
+        tracked_masks_by_variant=tracked_masks_by_variant,
         premerge_json_path=premerge_json_path,
         premerge_text_path=premerge_text_path,
         diagnostics=FragmentDiagnostics(
@@ -327,6 +553,9 @@ def solve_consensus_tracking(
             variant_deltas_to_best_input={},
         ),
         write_outputs=True,
+        optimized_geometry_payloads=optimized_geometry_payloads,
+        manifest_output_path=manifest_output_path,
+        geometry_assignments_json_path=geometry_assignments_json_path,
     )
 
 
@@ -344,6 +573,8 @@ def evaluate_saved_consensus_outputs(
     preparation = prepare_consensus(config, indexed_solutions, scorers=None)
     output_root = projectio.resolve_consensus_output_dir(config)
     output_root.mkdir(parents=True, exist_ok=True)
+    manifest = load_render_manifest(output_root)
+    variant_names = render_variant_names_from_manifest(manifest, source_names)
 
     premerge_json_path = output_root / "premerge_metrics.json"
     premerge_text_path = output_root / "premerge_metrics.txt"
@@ -361,7 +592,7 @@ def evaluate_saved_consensus_outputs(
 
     tracked_masks_by_variant: dict[str, np.ndarray] = {}
     lineage_rows: tuple[LineageRecord, ...] | None = None
-    for variant_name in ("intersection", "union", source_names[0], source_names[1]):
+    for variant_name in variant_names:
         variant_dir = output_root / variant_name
         saved_variant = projectio.load_saved_tracking_solution(variant_name, variant_dir, raw_frames)
         tracked_masks_by_variant[variant_name] = saved_variant.tracked_masks
@@ -372,6 +603,15 @@ def evaluate_saved_consensus_outputs(
 
     if lineage_rows is None:
         raise ValueError(f"No saved consensus variants were found under {output_root}.")
+
+    geometry_assignments_json_path = saved_geometry_assignments_path(output_root, manifest)
+    if manifest is None:
+        manifest = build_render_manifest(
+            config=config,
+            variant_names=variant_names,
+            geometry_assignments_filename=geometry_assignments_json_path.name if geometry_assignments_json_path is not None else None,
+        )
+    manifest_output_path = write_render_manifest(output_root, manifest)
 
     return _finalize_consensus_outputs(
         config=config,
@@ -392,6 +632,9 @@ def evaluate_saved_consensus_outputs(
             variant_deltas_to_best_input={},
         ),
         write_outputs=False,
+        optimized_geometry_payloads=load_saved_variant_geometry_metrics(output_root, variant_names),
+        manifest_output_path=manifest_output_path,
+        geometry_assignments_json_path=geometry_assignments_json_path,
     )
 
 
@@ -408,6 +651,9 @@ def _finalize_consensus_outputs(
     premerge_text_path: Path,
     diagnostics: FragmentDiagnostics,
     write_outputs: bool,
+    optimized_geometry_payloads: dict[str, dict[str, object]] | None = None,
+    manifest_output_path: Path | None = None,
+    geometry_assignments_json_path: Path | None = None,
 ) -> ConsensusResult:
     gt_index = _load_gt_solution_index(config, raw_frames)
     variant_evaluations: dict[str, VariantEvaluation] = {}
@@ -434,6 +680,8 @@ def _finalize_consensus_outputs(
                 selected_common_tracklets=len(common_node_ids),
             )
         }
+        if optimized_geometry_payloads is not None and variant_name in optimized_geometry_payloads:
+            metrics["optimized_geometry"] = dict(optimized_geometry_payloads[variant_name])
         if gt_index is not None:
             metrics["legacy_gt_metrics"] = evaluate_solution_against_gt(
                 build_solution_index(
@@ -488,6 +736,8 @@ def _finalize_consensus_outputs(
         "candidate_oracle": diagnostics.oracle_metrics,
         "variant_deltas_to_best_input": variant_deltas,
     }
+    if optimized_geometry_payloads:
+        diagnostics_payload["optimized_geometry"] = optimized_geometry_payloads
     diagnostics_json_path = output_root / "consensus_diagnostics.json"
     diagnostics_text_path = output_root / "consensus_diagnostics.txt"
     reporting.write_json(diagnostics_json_path, diagnostics_payload)
@@ -505,6 +755,8 @@ def _finalize_consensus_outputs(
         variant_evaluations=variant_evaluations,
         diagnostics_path=diagnostics_json_path,
         diagnostics_text_path=diagnostics_text_path,
+        render_manifest_path=manifest_output_path,
+        geometry_assignments_path=geometry_assignments_json_path,
     )
 
 
@@ -1165,6 +1417,14 @@ def solve_global_tracklet_ilp(
     if config.log_file is not None:
         model.Params.LogFile = str(config.log_file)
 
+    LOGGER.info(
+        "Building consensus ILP model: nodes=%s, move_candidates=%s, division_candidates=%s, hard_conflicts=%s.",
+        len(nodes),
+        len(preparation.continuation_candidates),
+        len(preparation.division_candidates),
+        len(preparation.hard_conflicts),
+    )
+
     activation_vars: dict[int, gp.Var] = {}
     appearance_vars: dict[int, gp.Var] = {}
     disappearance_vars: dict[int, gp.Var] = {}
@@ -1175,13 +1435,23 @@ def solve_global_tracklet_ilp(
     internal_consistency_cache: dict[int, float] = {}
     objective_terms: list[gp.LinExpr] = []
 
-    for node in nodes:
+    for node in progress_iter(
+        nodes,
+        desc="Consensus ILP build: activation variables",
+        total=len(nodes),
+        unit="node",
+    ):
         activation = model.addVar(vtype=GRB.BINARY, name=f"act[{node.node_id}]")
         activation_vars[node.node_id] = activation
         objective_terms.append(config.segmentation_reward * node.frame_count * activation)
         objective_terms.append(fragment_bonus(node, activation, scorers, indexed_solutions, internal_consistency_cache))
 
-    for node in nodes:
+    for node in progress_iter(
+        nodes,
+        desc="Consensus ILP build: boundary variables",
+        total=len(nodes),
+        unit="node",
+    ):
         appearance = model.addVar(vtype=GRB.BINARY, name=f"app[{node.node_id}]")
         disappearance = model.addVar(vtype=GRB.BINARY, name=f"dis[{node.node_id}]")
         appearance_vars[node.node_id] = appearance
@@ -1189,7 +1459,12 @@ def solve_global_tracklet_ilp(
         objective_terms.append(appearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * appearance)
         objective_terms.append(disappearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * disappearance)
 
-    for candidate in preparation.continuation_candidates:
+    for candidate in progress_iter(
+        preparation.continuation_candidates,
+        desc="Consensus ILP build: move variables",
+        total=len(preparation.continuation_candidates),
+        unit="edge",
+    ):
         parent = node_lookup[candidate.parent_id]
         child = node_lookup[candidate.child_id]
         variable = model.addVar(vtype=GRB.BINARY, name=f"move[{candidate.parent_id},{candidate.child_id}]")
@@ -1198,7 +1473,12 @@ def solve_global_tracklet_ilp(
         incoming_terms[candidate.child_id].append(variable)
         objective_terms.append(move_cost(scorers, parent, child) * variable)
 
-    for parent_id, child_id_1, child_id_2 in preparation.division_candidates:
+    for parent_id, child_id_1, child_id_2 in progress_iter(
+        preparation.division_candidates,
+        desc="Consensus ILP build: division variables",
+        total=len(preparation.division_candidates),
+        unit="edge",
+    ):
         parent = node_lookup[parent_id]
         child_1 = node_lookup[child_id_1]
         child_2 = node_lookup[child_id_2]
@@ -1210,7 +1490,12 @@ def solve_global_tracklet_ilp(
         objective_terms.append(division_cost(scorers, parent, child_1, child_2) * variable)
 
     constraint_count = 0
-    for node in nodes:
+    for node in progress_iter(
+        nodes,
+        desc="Consensus ILP build: flow constraints",
+        total=len(nodes),
+        unit="node",
+    ):
         target = activation_vars[node.node_id]
         model.addConstr(
             quicksum(incoming_terms[node.node_id]) + appearance_vars[node.node_id] == target,
@@ -1223,7 +1508,13 @@ def solve_global_tracklet_ilp(
         )
         constraint_count += 1
 
-    for left_id, right_id in sorted((tuple(sorted(pair)) for pair in preparation.hard_conflicts)):
+    sorted_hard_conflicts = sorted((tuple(sorted(pair)) for pair in preparation.hard_conflicts))
+    for left_id, right_id in progress_iter(
+        sorted_hard_conflicts,
+        desc="Consensus ILP build: hard-conflict constraints",
+        total=len(sorted_hard_conflicts),
+        unit="pair",
+    ):
         model.addConstr(
             activation_vars[left_id] + activation_vars[right_id] <= 1,
             name=f"conflict[{left_id},{right_id}]",
@@ -1231,7 +1522,12 @@ def solve_global_tracklet_ilp(
         constraint_count += 1
 
     tolerated_handoff_count = 0
-    for candidate in preparation.continuation_candidates:
+    for candidate in progress_iter(
+        preparation.continuation_candidates,
+        desc="Consensus ILP build: handoff constraints",
+        total=len(preparation.continuation_candidates),
+        unit="edge",
+    ):
         if not candidate.is_tolerated_handoff:
             continue
         tolerated_handoff_count += 1
@@ -1305,6 +1601,1041 @@ def solve_global_tracklet_ilp(
         "selected_source_specific_count_by_source": dict(sorted(selected_source_counts.items())),
         "selected_cross_source_continuation_count": cross_source_continuations,
     }
+
+
+def fixed_geometry_option(node: TrackletNode) -> str:
+    if node.source_name is None:
+        raise ValueError(f"Node {node.node_id} does not have a fixed source geometry.")
+    return node.source_name
+
+
+def node_geometry_options(
+    node: TrackletNode,
+    source_names: tuple[str, str],
+) -> tuple[str, ...]:
+    if node.is_common_supported:
+        return geometry_option_names(source_names)
+    return (fixed_geometry_option(node),)
+
+
+def selected_temporal_relations(
+    selected_nodes: set[int],
+    outgoing_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None],
+) -> tuple[tuple[str, int, int, float], ...]:
+    relations: list[tuple[str, int, int, float]] = []
+    for parent_id in sorted(selected_nodes):
+        outgoing = outgoing_choice.get(parent_id)
+        if outgoing is None:
+            continue
+        if outgoing[0] == "move":
+            relations.append(("move", parent_id, int(outgoing[1]), 1.0))
+            continue
+        relations.append(("division", parent_id, int(outgoing[1]), 0.5))
+        relations.append(("division", parent_id, int(outgoing[2]), 0.5))
+    return tuple(relations)
+
+
+def solve_two_stage_geometry_ilp(
+    config: TrackingConfig,
+    preparation: ConsensusPreparation,
+    indexed_solutions: dict[str, SolutionIndex],
+    selected_nodes: set[int],
+    incoming_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None],
+    outgoing_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None],
+) -> GeometryOptimizationResult:
+    if gp is None or GRB is None or quicksum is None:
+        raise RuntimeError("Gurobi is required to solve the two-stage geometry ILP but is not installed in this environment.")
+
+    source_names = tuple(config.consensus_sources)
+    node_lookup = {node.node_id: node for node in preparation.nodes}
+    selected_common_ids = sorted(node.node_id for node in preparation.nodes if node.node_id in selected_nodes and node.is_common_supported)
+    if not selected_common_ids:
+        return GeometryOptimizationResult(
+            variant_name=optimized_variant_name(TWO_STAGE_GEOMETRY_MODE),
+            common_geometry_assignments={},
+            diagnostics=geometry_diagnostics(
+                common_geometry_assignments={},
+                node_lookup=node_lookup,
+                source_names=source_names,
+                indexed_solutions=indexed_solutions,
+                selected_nodes=selected_nodes,
+                temporal_relations=selected_temporal_relations(selected_nodes, outgoing_choice),
+                same_frame_pairs=(),
+                source_weight=config.geometry_source_weight,
+                temporal_weight=config.geometry_temporal_overlap_weight,
+                neighbor_radius=config.geometry_neighbor_radius,
+            ),
+        )
+
+    selected_source_ids = {
+        node.node_id
+        for node in preparation.nodes
+        if node.node_id in selected_nodes and not node.is_common_supported
+    }
+    LOGGER.info(
+        "Two-stage geometry setup: selected_common=%s, selected_source=%s.",
+        len(selected_common_ids),
+        len(selected_source_ids),
+    )
+    geometry_cache = GeometryQueryCache()
+    same_frame_pairs = find_same_frame_neighbor_pairs(
+        nodes=preparation.nodes,
+        indexed_solutions=indexed_solutions,
+        source_names=source_names,
+        radius=config.geometry_neighbor_radius,
+        selected_node_ids=selected_nodes,
+        cache=geometry_cache,
+        progress_desc="Finding two-stage same-frame geometry neighbors",
+    )
+    frame_count = len(next(iter(indexed_solutions.values())).solution.frames)
+    common_source_candidates, common_common_candidates = build_common_overlap_candidate_pairs(
+        nodes=preparation.nodes,
+        frame_count=frame_count,
+        candidate_node_ids=selected_nodes,
+    )
+    common_source_candidate_count = sum(len(source_ids) for source_ids in common_source_candidates.values())
+    LOGGER.info(
+        "Two-stage geometry candidate pruning: common/source=%s, common/common=%s, same-frame neighbor pairs=%s.",
+        common_source_candidate_count,
+        len(common_common_candidates),
+        len(same_frame_pairs),
+    )
+    temporal_relations = selected_temporal_relations(selected_nodes, outgoing_choice)
+
+    model = gp.Model("PyTr2dGeometryTwoStage")
+    model.Params.OutputFlag = 1
+    model.Params.LogToConsole = 1
+    if config.log_file is not None:
+        model.Params.LogFile = str(config.log_file)
+
+    geometry_vars: dict[tuple[int, str], gp.Var] = {}
+    objective_terms: list[gp.LinExpr] = []
+    for node_id in selected_common_ids:
+        options = geometry_option_names(source_names)
+        for option_name in options:
+            geometry_vars[(node_id, option_name)] = model.addVar(
+                vtype=GRB.BINARY,
+                name=f"geom[{node_id},{option_name}]",
+            )
+        model.addConstr(
+            quicksum(geometry_vars[(node_id, option_name)] for option_name in options) == 1,
+            name=f"geom_one[{node_id}]",
+        )
+
+    forbidden_option_count = 0
+    for node_id in progress_iter(
+        selected_common_ids,
+        desc="Building two-stage source-conflict forbids",
+        total=len(selected_common_ids),
+        unit="common fragment",
+    ):
+        node = node_lookup[node_id]
+        candidate_source_ids = common_source_candidates.get(node_id, ())
+        if not candidate_source_ids:
+            continue
+        for option_name in geometry_option_names(source_names):
+            if any(
+                option_pair_overlaps_any_shared_frame(
+                    node,
+                    option_name,
+                    node_lookup[source_node_id],
+                    fixed_geometry_option(node_lookup[source_node_id]),
+                    indexed_solutions,
+                    cache=geometry_cache,
+                )
+                for source_node_id in candidate_source_ids
+            ):
+                model.addConstr(geometry_vars[(node_id, option_name)] == 0, name=f"geom_forbid_source[{node_id},{option_name}]")
+                forbidden_option_count += 1
+
+    LOGGER.info("Two-stage geometry forbids added for %s common option(s).", forbidden_option_count)
+
+    common_conflict_constraint_count = 0
+    for left_id, right_id in progress_iter(
+        common_common_candidates,
+        desc="Building two-stage common/common conflicts",
+        total=len(common_common_candidates),
+        unit="pair",
+    ):
+        left_node = node_lookup[left_id]
+        right_node = node_lookup[right_id]
+        for left_option in geometry_option_names(source_names):
+            for right_option in geometry_option_names(source_names):
+                if option_pair_overlaps_any_shared_frame(
+                    left_node,
+                    left_option,
+                    right_node,
+                    right_option,
+                    indexed_solutions,
+                    cache=geometry_cache,
+                ):
+                    model.addConstr(
+                        geometry_vars[(left_id, left_option)] + geometry_vars[(right_id, right_option)] <= 1,
+                        name=f"geom_conflict[{left_id},{left_option},{right_id},{right_option}]",
+                    )
+                    common_conflict_constraint_count += 1
+
+    LOGGER.info("Two-stage geometry added %s common/common conflict constraint(s).", common_conflict_constraint_count)
+
+    for _kind, parent_id, child_id, relation_weight in temporal_relations:
+        parent = node_lookup[parent_id]
+        child = node_lookup[child_id]
+        if not (parent.is_common_supported or child.is_common_supported):
+            continue
+        if parent.is_common_supported and child.is_common_supported:
+            for parent_option in geometry_option_names(source_names):
+                for child_option in geometry_option_names(source_names):
+                    variable = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"geom_temporal[{parent_id},{parent_option},{child_id},{child_option}]",
+                    )
+                    model.addConstr(variable <= geometry_vars[(parent_id, parent_option)])
+                    model.addConstr(variable <= geometry_vars[(child_id, child_option)])
+                    model.addConstr(
+                        variable >= geometry_vars[(parent_id, parent_option)] + geometry_vars[(child_id, child_option)] - 1
+                    )
+                    objective_terms.append(
+                        relation_weight
+                        * geometry_temporal_score(
+                            parent=parent,
+                            parent_option=parent_option,
+                            child=child,
+                            child_option=child_option,
+                            source_names=source_names,
+                            indexed_solutions=indexed_solutions,
+                            source_weight=config.geometry_source_weight,
+                            temporal_weight=config.geometry_temporal_overlap_weight,
+                        )
+                        * variable
+                    )
+        else:
+            common_node = parent if parent.is_common_supported else child
+            fixed_node = child if parent.is_common_supported else parent
+            fixed_option = fixed_geometry_option(fixed_node)
+            for common_option in geometry_option_names(source_names):
+                objective_terms.append(
+                    relation_weight
+                    * geometry_temporal_score(
+                        parent=parent if parent.is_common_supported else fixed_node,
+                        parent_option=common_option if parent.is_common_supported else fixed_option,
+                        child=child if child.is_common_supported else fixed_node,
+                        child_option=common_option if child.is_common_supported else fixed_option,
+                        source_names=source_names,
+                        indexed_solutions=indexed_solutions,
+                        source_weight=config.geometry_source_weight,
+                        temporal_weight=config.geometry_temporal_overlap_weight,
+                    )
+                    * geometry_vars[(common_node.node_id, common_option)]
+                )
+
+    for left_id, right_id in same_frame_pairs:
+        left_node = node_lookup[left_id]
+        right_node = node_lookup[right_id]
+        if left_node.is_common_supported and right_node.is_common_supported:
+            for left_option in geometry_option_names(source_names):
+                for right_option in geometry_option_names(source_names):
+                    variable = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"geom_neighbor[{left_id},{left_option},{right_id},{right_option}]",
+                    )
+                    model.addConstr(variable <= geometry_vars[(left_id, left_option)])
+                    model.addConstr(variable <= geometry_vars[(right_id, right_option)])
+                    model.addConstr(
+                        variable >= geometry_vars[(left_id, left_option)] + geometry_vars[(right_id, right_option)] - 1
+                    )
+                    objective_terms.append(
+                        geometry_same_frame_score(
+                            left_option=left_option,
+                            right_option=right_option,
+                            source_names=source_names,
+                            source_weight=config.geometry_source_weight,
+                        )
+                        * variable
+                    )
+        else:
+            common_node = left_node if left_node.is_common_supported else right_node
+            fixed_node = right_node if left_node.is_common_supported else left_node
+            fixed_option = fixed_geometry_option(fixed_node)
+            for common_option in geometry_option_names(source_names):
+                objective_terms.append(
+                    geometry_same_frame_score(
+                        left_option=common_option if left_node.is_common_supported else fixed_option,
+                        right_option=common_option if right_node.is_common_supported else fixed_option,
+                        source_names=source_names,
+                        source_weight=config.geometry_source_weight,
+                    )
+                    * geometry_vars[(common_node.node_id, common_option)]
+                )
+
+    model.setObjective(quicksum(objective_terms), GRB.MAXIMIZE)
+    LOGGER.info(
+        "Starting Gurobi optimization for two-stage geometry ILP with %s selected common node(s).",
+        len(selected_common_ids),
+    )
+    model.optimize()
+    _assert_usable_status(model)
+
+    assignments = {
+        node_id: option_name
+        for (node_id, option_name), variable in geometry_vars.items()
+        if variable.X > 0.5
+    }
+    diagnostics = geometry_diagnostics(
+        common_geometry_assignments=assignments,
+        node_lookup=node_lookup,
+        source_names=source_names,
+        indexed_solutions=indexed_solutions,
+        selected_nodes=selected_nodes,
+        temporal_relations=temporal_relations,
+        same_frame_pairs=same_frame_pairs,
+        source_weight=config.geometry_source_weight,
+        temporal_weight=config.geometry_temporal_overlap_weight,
+        neighbor_radius=config.geometry_neighbor_radius,
+    )
+    return GeometryOptimizationResult(
+        variant_name=optimized_variant_name(TWO_STAGE_GEOMETRY_MODE),
+        common_geometry_assignments=assignments,
+        diagnostics=diagnostics,
+    )
+
+
+def solve_joint_tracklet_geometry_ilp(
+    config: TrackingConfig,
+    preparation: ConsensusPreparation,
+    indexed_solutions: dict[str, SolutionIndex],
+    scorers: EventScorers,
+) -> tuple[
+    set[int],
+    dict[int, tuple[str, int] | tuple[str, int, int] | None],
+    dict[int, tuple[str, int] | tuple[str, int, int] | None],
+    dict[str, object],
+    dict[int, str],
+    dict[str, object],
+]:
+    if gp is None or GRB is None or quicksum is None:
+        raise RuntimeError("Gurobi is required to solve the joint geometry ILP but is not installed in this environment.")
+
+    source_names = tuple(config.consensus_sources)
+    nodes = preparation.nodes
+    if not nodes:
+        return set(), {}, {}, {"selected_total_count": 0}, {}, {}
+
+    node_lookup = {node.node_id: node for node in nodes}
+    source_specific_hard_conflicts = tuple(
+        pair
+        for pair in preparation.hard_conflicts
+        if all(not node_lookup[node_id].is_common_supported for node_id in pair)
+    )
+    same_frame_pairs = find_same_frame_neighbor_pairs(
+        nodes=nodes,
+        indexed_solutions=indexed_solutions,
+        source_names=source_names,
+        radius=config.geometry_neighbor_radius,
+        selected_node_ids=None,
+    )
+
+    model = gp.Model("PyTr2dConsensusJoint")
+    model.Params.OutputFlag = 1
+    model.Params.LogToConsole = 1
+    if config.log_file is not None:
+        model.Params.LogFile = str(config.log_file)
+
+    activation_vars: dict[int, gp.Var] = {}
+    appearance_vars: dict[int, gp.Var] = {}
+    disappearance_vars: dict[int, gp.Var] = {}
+    move_vars: dict[tuple[int, int], gp.Var] = {}
+    division_vars: dict[tuple[int, int, int], gp.Var] = {}
+    geometry_vars: dict[tuple[int, str], gp.Var] = {}
+    incoming_terms: dict[int, list[gp.Var]] = defaultdict(list)
+    outgoing_terms: dict[int, list[gp.Var]] = defaultdict(list)
+    internal_consistency_cache: dict[int, float] = {}
+    objective_terms: list[gp.LinExpr] = []
+
+    for node in nodes:
+        activation = model.addVar(vtype=GRB.BINARY, name=f"act[{node.node_id}]")
+        activation_vars[node.node_id] = activation
+        objective_terms.append(config.segmentation_reward * node.frame_count * activation)
+        objective_terms.append(fragment_bonus(node, activation, scorers, indexed_solutions, internal_consistency_cache))
+        if node.is_common_supported:
+            for option_name in geometry_option_names(source_names):
+                geometry_vars[(node.node_id, option_name)] = model.addVar(
+                    vtype=GRB.BINARY,
+                    name=f"geom[{node.node_id},{option_name}]",
+                )
+            model.addConstr(
+                quicksum(geometry_vars[(node.node_id, option_name)] for option_name in geometry_option_names(source_names)) == activation,
+                name=f"geom_one[{node.node_id}]",
+            )
+
+    for node in nodes:
+        appearance = model.addVar(vtype=GRB.BINARY, name=f"app[{node.node_id}]")
+        disappearance = model.addVar(vtype=GRB.BINARY, name=f"dis[{node.node_id}]")
+        appearance_vars[node.node_id] = appearance
+        disappearance_vars[node.node_id] = disappearance
+        objective_terms.append(appearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * appearance)
+        objective_terms.append(disappearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * disappearance)
+
+    for candidate in preparation.continuation_candidates:
+        parent = node_lookup[candidate.parent_id]
+        child = node_lookup[candidate.child_id]
+        variable = model.addVar(vtype=GRB.BINARY, name=f"move[{candidate.parent_id},{candidate.child_id}]")
+        move_vars[(candidate.parent_id, candidate.child_id)] = variable
+        outgoing_terms[candidate.parent_id].append(variable)
+        incoming_terms[candidate.child_id].append(variable)
+        objective_terms.append(move_cost(scorers, parent, child) * variable)
+
+    for parent_id, child_id_1, child_id_2 in preparation.division_candidates:
+        parent = node_lookup[parent_id]
+        child_1 = node_lookup[child_id_1]
+        child_2 = node_lookup[child_id_2]
+        variable = model.addVar(vtype=GRB.BINARY, name=f"div[{parent_id},{child_id_1},{child_id_2}]")
+        division_vars[(parent_id, child_id_1, child_id_2)] = variable
+        outgoing_terms[parent_id].append(variable)
+        incoming_terms[child_id_1].append(variable)
+        incoming_terms[child_id_2].append(variable)
+        objective_terms.append(division_cost(scorers, parent, child_1, child_2) * variable)
+
+    constraint_count = 0
+    for node in nodes:
+        target = activation_vars[node.node_id]
+        model.addConstr(quicksum(incoming_terms[node.node_id]) + appearance_vars[node.node_id] == target, name=f"incoming[{node.node_id}]")
+        model.addConstr(quicksum(outgoing_terms[node.node_id]) + disappearance_vars[node.node_id] == target, name=f"outgoing[{node.node_id}]")
+        constraint_count += 2
+
+    for left_id, right_id in sorted((tuple(sorted(pair)) for pair in source_specific_hard_conflicts)):
+        model.addConstr(
+            activation_vars[left_id] + activation_vars[right_id] <= 1,
+            name=f"conflict_static[{left_id},{right_id}]",
+        )
+        constraint_count += 1
+
+    for candidate in preparation.continuation_candidates:
+        if not candidate.is_tolerated_handoff:
+            continue
+        model.addConstr(
+            activation_vars[candidate.parent_id] + activation_vars[candidate.child_id] - move_vars[(candidate.parent_id, candidate.child_id)] <= 1,
+            name=f"handoff[{candidate.parent_id},{candidate.child_id}]",
+        )
+        constraint_count += 1
+
+    common_node_ids = [node.node_id for node in nodes if node.is_common_supported]
+    source_node_ids = [node.node_id for node in nodes if not node.is_common_supported]
+    for common_node_id in common_node_ids:
+        common_node = node_lookup[common_node_id]
+        for option_name in geometry_option_names(source_names):
+            for source_node_id in source_node_ids:
+                source_node = node_lookup[source_node_id]
+                if option_pair_overlaps_any_shared_frame(
+                    common_node,
+                    option_name,
+                    source_node,
+                    fixed_geometry_option(source_node),
+                    indexed_solutions,
+                ):
+                    model.addConstr(
+                        geometry_vars[(common_node_id, option_name)] + activation_vars[source_node_id] <= 1,
+                        name=f"geom_source_conflict[{common_node_id},{option_name},{source_node_id}]",
+                    )
+                    constraint_count += 1
+
+    for left_id, right_id in combinations(common_node_ids, 2):
+        left_node = node_lookup[left_id]
+        right_node = node_lookup[right_id]
+        for left_option in geometry_option_names(source_names):
+            for right_option in geometry_option_names(source_names):
+                if option_pair_overlaps_any_shared_frame(
+                    left_node,
+                    left_option,
+                    right_node,
+                    right_option,
+                    indexed_solutions,
+                ):
+                    model.addConstr(
+                        geometry_vars[(left_id, left_option)] + geometry_vars[(right_id, right_option)] <= 1,
+                        name=f"geom_conflict[{left_id},{left_option},{right_id},{right_option}]",
+                    )
+                    constraint_count += 1
+
+    for (parent_id, child_id), move_var in move_vars.items():
+        parent = node_lookup[parent_id]
+        child = node_lookup[child_id]
+        if not (parent.is_common_supported or child.is_common_supported):
+            continue
+        if parent.is_common_supported and child.is_common_supported:
+            for parent_option in geometry_option_names(source_names):
+                for child_option in geometry_option_names(source_names):
+                    variable = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"geom_move[{parent_id},{parent_option},{child_id},{child_option}]",
+                    )
+                    model.addConstr(variable <= move_var)
+                    model.addConstr(variable <= geometry_vars[(parent_id, parent_option)])
+                    model.addConstr(variable <= geometry_vars[(child_id, child_option)])
+                    model.addConstr(
+                        variable >= move_var + geometry_vars[(parent_id, parent_option)] + geometry_vars[(child_id, child_option)] - 2
+                    )
+                    objective_terms.append(
+                        -geometry_temporal_score(
+                            parent=parent,
+                            parent_option=parent_option,
+                            child=child,
+                            child_option=child_option,
+                            source_names=source_names,
+                            indexed_solutions=indexed_solutions,
+                            source_weight=config.geometry_source_weight,
+                            temporal_weight=config.geometry_temporal_overlap_weight,
+                        )
+                        * variable
+                    )
+        else:
+            common_node = parent if parent.is_common_supported else child
+            fixed_node = child if parent.is_common_supported else parent
+            fixed_option = fixed_geometry_option(fixed_node)
+            for common_option in geometry_option_names(source_names):
+                variable = model.addVar(
+                    vtype=GRB.BINARY,
+                    name=f"geom_move_fixed[{parent_id},{child_id},{common_option}]",
+                )
+                model.addConstr(variable <= move_var)
+                model.addConstr(variable <= geometry_vars[(common_node.node_id, common_option)])
+                model.addConstr(variable >= move_var + geometry_vars[(common_node.node_id, common_option)] - 1)
+                objective_terms.append(
+                    -geometry_temporal_score(
+                        parent=parent if parent.is_common_supported else fixed_node,
+                        parent_option=common_option if parent.is_common_supported else fixed_option,
+                        child=child if child.is_common_supported else fixed_node,
+                        child_option=common_option if child.is_common_supported else fixed_option,
+                        source_names=source_names,
+                        indexed_solutions=indexed_solutions,
+                        source_weight=config.geometry_source_weight,
+                        temporal_weight=config.geometry_temporal_overlap_weight,
+                    )
+                    * variable
+                )
+
+    for (parent_id, child_id_1, child_id_2), division_var in division_vars.items():
+        parent = node_lookup[parent_id]
+        child_1 = node_lookup[child_id_1]
+        child_2 = node_lookup[child_id_2]
+        for child in (child_1, child_2):
+            if not (parent.is_common_supported or child.is_common_supported):
+                continue
+            if parent.is_common_supported and child.is_common_supported:
+                for parent_option in geometry_option_names(source_names):
+                    for child_option in geometry_option_names(source_names):
+                        variable = model.addVar(
+                            vtype=GRB.BINARY,
+                            name=f"geom_div[{parent_id},{parent_option},{child.node_id},{child_option}]",
+                        )
+                        model.addConstr(variable <= division_var)
+                        model.addConstr(variable <= geometry_vars[(parent_id, parent_option)])
+                        model.addConstr(variable <= geometry_vars[(child.node_id, child_option)])
+                        model.addConstr(
+                            variable >= division_var + geometry_vars[(parent_id, parent_option)] + geometry_vars[(child.node_id, child_option)] - 2
+                        )
+                        objective_terms.append(
+                            -0.5
+                            * geometry_temporal_score(
+                                parent=parent,
+                                parent_option=parent_option,
+                                child=child,
+                                child_option=child_option,
+                                source_names=source_names,
+                                indexed_solutions=indexed_solutions,
+                                source_weight=config.geometry_source_weight,
+                                temporal_weight=config.geometry_temporal_overlap_weight,
+                            )
+                            * variable
+                        )
+            else:
+                common_node = parent if parent.is_common_supported else child
+                fixed_node = child if parent.is_common_supported else parent
+                fixed_option = fixed_geometry_option(fixed_node)
+                for common_option in geometry_option_names(source_names):
+                    variable = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"geom_div_fixed[{parent_id},{child.node_id},{common_option}]",
+                    )
+                    model.addConstr(variable <= division_var)
+                    model.addConstr(variable <= geometry_vars[(common_node.node_id, common_option)])
+                    model.addConstr(variable >= division_var + geometry_vars[(common_node.node_id, common_option)] - 1)
+                    objective_terms.append(
+                        -0.5
+                        * geometry_temporal_score(
+                            parent=parent if parent.is_common_supported else fixed_node,
+                            parent_option=common_option if parent.is_common_supported else fixed_option,
+                            child=child if child.is_common_supported else fixed_node,
+                            child_option=common_option if child.is_common_supported else fixed_option,
+                            source_names=source_names,
+                            indexed_solutions=indexed_solutions,
+                            source_weight=config.geometry_source_weight,
+                            temporal_weight=config.geometry_temporal_overlap_weight,
+                        )
+                        * variable
+                    )
+
+    for left_id, right_id in same_frame_pairs:
+        left_node = node_lookup[left_id]
+        right_node = node_lookup[right_id]
+        if left_node.is_common_supported and right_node.is_common_supported:
+            for left_option in geometry_option_names(source_names):
+                for right_option in geometry_option_names(source_names):
+                    variable = model.addVar(
+                        vtype=GRB.BINARY,
+                        name=f"geom_neighbor[{left_id},{left_option},{right_id},{right_option}]",
+                    )
+                    model.addConstr(variable <= geometry_vars[(left_id, left_option)])
+                    model.addConstr(variable <= geometry_vars[(right_id, right_option)])
+                    model.addConstr(
+                        variable >= geometry_vars[(left_id, left_option)] + geometry_vars[(right_id, right_option)] - 1
+                    )
+                    objective_terms.append(
+                        -geometry_same_frame_score(
+                            left_option=left_option,
+                            right_option=right_option,
+                            source_names=source_names,
+                            source_weight=config.geometry_source_weight,
+                        )
+                        * variable
+                    )
+        else:
+            common_node = left_node if left_node.is_common_supported else right_node
+            fixed_node = right_node if left_node.is_common_supported else left_node
+            fixed_option = fixed_geometry_option(fixed_node)
+            for common_option in geometry_option_names(source_names):
+                variable = model.addVar(
+                    vtype=GRB.BINARY,
+                    name=f"geom_neighbor_fixed[{left_id},{right_id},{common_option}]",
+                )
+                model.addConstr(variable <= activation_vars[fixed_node.node_id])
+                model.addConstr(variable <= geometry_vars[(common_node.node_id, common_option)])
+                model.addConstr(variable >= activation_vars[fixed_node.node_id] + geometry_vars[(common_node.node_id, common_option)] - 1)
+                objective_terms.append(
+                    -geometry_same_frame_score(
+                        left_option=common_option if left_node.is_common_supported else fixed_option,
+                        right_option=common_option if right_node.is_common_supported else fixed_option,
+                        source_names=source_names,
+                        source_weight=config.geometry_source_weight,
+                    )
+                    * variable
+                )
+
+    LOGGER.info(
+        "Consensus joint ILP: nodes=%s, common_supported=%s, source_specific=%s, move=%s, division=%s, same_frame_pairs=%s, constraints=%s.",
+        len(nodes),
+        len(common_node_ids),
+        len(source_node_ids),
+        len(move_vars),
+        len(division_vars),
+        len(same_frame_pairs),
+        constraint_count,
+    )
+    model.setObjective(quicksum(objective_terms), GRB.MINIMIZE)
+    LOGGER.info("Starting Gurobi optimization for joint consensus/geometry ILP.")
+    model.optimize()
+    _assert_usable_status(model)
+
+    selected_nodes = {node_id for node_id, variable in activation_vars.items() if variable.X > 0.5}
+    incoming_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None] = {}
+    outgoing_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None] = {}
+    for node_id in selected_nodes:
+        incoming_choice[node_id] = None
+        outgoing_choice[node_id] = None
+    for (parent_id, child_id), variable in move_vars.items():
+        if variable.X > 0.5:
+            outgoing_choice[parent_id] = ("move", child_id)
+            incoming_choice[child_id] = ("move", parent_id)
+    for (parent_id, child_id_1, child_id_2), variable in division_vars.items():
+        if variable.X > 0.5:
+            outgoing_choice[parent_id] = ("division", child_id_1, child_id_2)
+            incoming_choice[child_id_1] = ("division", parent_id, child_id_2)
+            incoming_choice[child_id_2] = ("division", parent_id, child_id_1)
+    for node_id, variable in appearance_vars.items():
+        if node_id in selected_nodes and variable.X > 0.5:
+            incoming_choice[node_id] = None
+    for node_id, variable in disappearance_vars.items():
+        if node_id in selected_nodes and variable.X > 0.5:
+            outgoing_choice[node_id] = None
+
+    assignments = {
+        node_id: option_name
+        for (node_id, option_name), variable in geometry_vars.items()
+        if node_id in selected_nodes and variable.X > 0.5
+    }
+
+    selected_source_counts: dict[str, int] = defaultdict(int)
+    selected_common_count = 0
+    cross_source_continuations = 0
+    for node_id in selected_nodes:
+        node = node_lookup[node_id]
+        if node.is_common_supported:
+            selected_common_count += 1
+        elif node.source_name is not None:
+            selected_source_counts[node.source_name] += 1
+    for (parent_id, child_id), variable in move_vars.items():
+        if variable.X <= 0.5:
+            continue
+        parent = node_lookup[parent_id]
+        child = node_lookup[child_id]
+        if dominant_source(parent) != dominant_source(child):
+            cross_source_continuations += 1
+
+    selected_graph_stats = {
+        "selected_total_count": len(selected_nodes),
+        "selected_common_supported_count": selected_common_count,
+        "selected_source_specific_count_by_source": dict(sorted(selected_source_counts.items())),
+        "selected_cross_source_continuation_count": cross_source_continuations,
+    }
+    geometry_diag = geometry_diagnostics(
+        common_geometry_assignments=assignments,
+        node_lookup=node_lookup,
+        source_names=source_names,
+        indexed_solutions=indexed_solutions,
+        selected_nodes=selected_nodes,
+        temporal_relations=selected_temporal_relations(selected_nodes, outgoing_choice),
+        same_frame_pairs=same_frame_pairs,
+        source_weight=config.geometry_source_weight,
+        temporal_weight=config.geometry_temporal_overlap_weight,
+        neighbor_radius=config.geometry_neighbor_radius,
+    )
+    LOGGER.info("Consensus joint ILP selected %s fragment node(s) with %s geometry assignment(s).", len(selected_nodes), len(assignments))
+    return selected_nodes, incoming_choice, outgoing_choice, selected_graph_stats, assignments, geometry_diag
+
+
+def geometry_temporal_score(
+    parent: TrackletNode,
+    parent_option: str,
+    child: TrackletNode,
+    child_option: str,
+    source_names: tuple[str, str],
+    indexed_solutions: dict[str, SolutionIndex],
+    source_weight: float,
+    temporal_weight: float,
+) -> float:
+    return (
+        source_weight * geometry_source_agreement(parent_option, child_option, source_names)
+        + temporal_weight * temporal_boundary_iou(parent, parent_option, child, child_option, indexed_solutions)
+    )
+
+
+def geometry_same_frame_score(
+    left_option: str,
+    right_option: str,
+    source_names: tuple[str, str],
+    source_weight: float,
+) -> float:
+    return source_weight * geometry_source_agreement(left_option, right_option, source_names)
+
+
+def geometry_diagnostics(
+    common_geometry_assignments: dict[int, str],
+    node_lookup: dict[int, TrackletNode],
+    source_names: tuple[str, str],
+    indexed_solutions: dict[str, SolutionIndex],
+    selected_nodes: set[int],
+    temporal_relations: tuple[tuple[str, int, int, float], ...],
+    same_frame_pairs: tuple[tuple[int, int], ...],
+    source_weight: float,
+    temporal_weight: float,
+    neighbor_radius: int,
+) -> dict[str, object]:
+    option_counts: dict[str, int] = defaultdict(int)
+    source_scores: list[float] = []
+    temporal_bonus_values: list[float] = []
+    selected_source_ids = {
+        node_id
+        for node_id in selected_nodes
+        if not node_lookup[node_id].is_common_supported
+    }
+
+    for option_name in common_geometry_assignments.values():
+        option_counts[option_name] += 1
+
+    for _kind, parent_id, child_id, _weight in temporal_relations:
+        parent = node_lookup[parent_id]
+        child = node_lookup[child_id]
+        parent_option = common_geometry_assignments[parent_id] if parent_id in common_geometry_assignments else fixed_geometry_option(parent)
+        child_option = common_geometry_assignments[child_id] if child_id in common_geometry_assignments else fixed_geometry_option(child)
+        source_scores.append(geometry_source_agreement(parent_option, child_option, source_names))
+        temporal_bonus_values.append(temporal_boundary_iou(parent, parent_option, child, child_option, indexed_solutions))
+
+    for left_id, right_id in same_frame_pairs:
+        left = node_lookup[left_id]
+        right = node_lookup[right_id]
+        if left_id not in selected_nodes or right_id not in selected_nodes:
+            continue
+        left_option = common_geometry_assignments[left_id] if left_id in common_geometry_assignments else fixed_geometry_option(left)
+        right_option = common_geometry_assignments[right_id] if right_id in common_geometry_assignments else fixed_geometry_option(right)
+        source_scores.append(geometry_source_agreement(left_option, right_option, source_names))
+
+    ruled_out_options = 0
+    for node_id, node in node_lookup.items():
+        if node_id not in selected_nodes or not node.is_common_supported:
+            continue
+        for option_name in geometry_option_names(source_names):
+            if option_name == common_geometry_assignments.get(node_id):
+                continue
+            blocked_by_source = any(
+                option_pair_overlaps_any_shared_frame(
+                    node,
+                    option_name,
+                    node_lookup[source_node_id],
+                    fixed_geometry_option(node_lookup[source_node_id]),
+                    indexed_solutions,
+                )
+                for source_node_id in selected_source_ids
+            )
+            blocked_by_common = any(
+                other_node_id != node_id
+                and other_node_id in selected_nodes
+                and node_lookup[other_node_id].is_common_supported
+                and option_pair_overlaps_any_shared_frame(
+                    node,
+                    option_name,
+                    node_lookup[other_node_id],
+                    common_geometry_assignments[other_node_id],
+                    indexed_solutions,
+                )
+                for other_node_id in common_geometry_assignments
+            )
+            if blocked_by_source or blocked_by_common:
+                ruled_out_options += 1
+
+    return {
+        "assignment_count_by_option": dict(sorted(option_counts.items())),
+        "average_source_consistency_score": float(np.mean(source_scores)) if source_scores else 0.0,
+        "average_temporal_overlap_bonus": float(np.mean(temporal_bonus_values)) if temporal_bonus_values else 0.0,
+        "ruled_out_option_count": int(ruled_out_options),
+        "neighbor_pair_count": int(len(same_frame_pairs)),
+        "geometry_source_weight": float(source_weight),
+        "geometry_temporal_overlap_weight": float(temporal_weight),
+        "geometry_neighbor_radius": int(neighbor_radius),
+    }
+
+
+def build_common_overlap_candidate_pairs(
+    nodes: tuple[TrackletNode, ...],
+    *,
+    frame_count: int,
+    candidate_node_ids: set[int] | None = None,
+) -> tuple[dict[int, tuple[int, ...]], tuple[tuple[int, int], ...]]:
+    common_ids_by_frame: list[set[int]] = [set() for _ in range(frame_count)]
+    source_ids_by_frame: list[set[int]] = [set() for _ in range(frame_count)]
+    for node in nodes:
+        if candidate_node_ids is not None and node.node_id not in candidate_node_ids:
+            continue
+        target = common_ids_by_frame if node.is_common_supported else source_ids_by_frame
+        for frame_index in range(node.begin, node.end + 1):
+            target[frame_index].add(node.node_id)
+
+    common_source_candidates: dict[int, set[int]] = defaultdict(set)
+    common_common_candidates: set[tuple[int, int]] = set()
+    for frame_index in range(frame_count):
+        common_ids = tuple(sorted(common_ids_by_frame[frame_index]))
+        source_ids = source_ids_by_frame[frame_index]
+        for common_id in common_ids:
+            common_source_candidates[common_id].update(source_ids)
+        for left_id, right_id in combinations(common_ids, 2):
+            common_common_candidates.add((left_id, right_id))
+
+    return (
+        {node_id: tuple(sorted(source_ids)) for node_id, source_ids in common_source_candidates.items() if source_ids},
+        tuple(sorted(common_common_candidates)),
+    )
+
+
+def find_same_frame_neighbor_pairs(
+    nodes: tuple[TrackletNode, ...],
+    indexed_solutions: dict[str, SolutionIndex],
+    source_names: tuple[str, str],
+    radius: int,
+    selected_node_ids: set[int] | None,
+    cache: GeometryQueryCache | None = None,
+    progress_desc: str | None = None,
+) -> tuple[tuple[int, int], ...]:
+    if radius < 0:
+        return ()
+    frame_count = len(next(iter(indexed_solutions.values())).solution.frames)
+    active_nodes_by_frame: list[list[int]] = [[] for _ in range(frame_count)]
+    node_lookup = {node.node_id: node for node in nodes}
+    for node in nodes:
+        if selected_node_ids is not None and node.node_id not in selected_node_ids:
+            continue
+        for frame_index in range(node.begin, node.end + 1):
+            active_nodes_by_frame[frame_index].append(node.node_id)
+
+    candidate_pairs: set[tuple[int, int]] = set()
+    for node in nodes:
+        if not node.is_common_supported:
+            continue
+        if selected_node_ids is not None and node.node_id not in selected_node_ids:
+            continue
+        for frame_index in range(node.begin, node.end + 1):
+            for other_node_id in active_nodes_by_frame[frame_index]:
+                if other_node_id == node.node_id:
+                    continue
+                left_id, right_id = sorted((node.node_id, other_node_id))
+                pair_key = (left_id, right_id)
+                if pair_key in candidate_pairs:
+                    continue
+                candidate_pairs.add(pair_key)
+
+    sorted_pairs = tuple(sorted(candidate_pairs))
+    if progress_desc is not None:
+        LOGGER.info("%s: evaluating %s temporal-overlap candidate pair(s).", progress_desc, len(sorted_pairs))
+        pair_iterable = progress_iter(sorted_pairs, desc=progress_desc, total=len(sorted_pairs), unit="pair")
+    else:
+        pair_iterable = sorted_pairs
+
+    confirmed_pairs: list[tuple[int, int]] = []
+    for left_id, right_id in pair_iterable:
+        if option_pair_within_radius_any_shared_frame(
+            node_lookup[left_id],
+            node_lookup[right_id],
+            indexed_solutions=indexed_solutions,
+            source_names=source_names,
+            radius=radius,
+            cache=cache,
+        ):
+            confirmed_pairs.append((left_id, right_id))
+    return tuple(confirmed_pairs)
+
+
+def option_pair_within_radius_any_shared_frame(
+    left_node: TrackletNode,
+    right_node: TrackletNode,
+    *,
+    indexed_solutions: dict[str, SolutionIndex],
+    source_names: tuple[str, str],
+    radius: int,
+    cache: GeometryQueryCache | None = None,
+) -> bool:
+    begin = max(left_node.begin, right_node.begin)
+    end = min(left_node.end, right_node.end)
+    if begin > end:
+        return False
+    for left_option in node_geometry_options(left_node, source_names):
+        for right_option in node_geometry_options(right_node, source_names):
+            for frame_index in range(begin, end + 1):
+                left_bbox = node_bbox_for_option(left_node, left_option, frame_index, indexed_solutions, cache=cache)
+                right_bbox = node_bbox_for_option(right_node, right_option, frame_index, indexed_solutions, cache=cache)
+                if not bboxes_within_radius(left_bbox, right_bbox, radius):
+                    continue
+                left_coords = node_coords_for_option(left_node, left_option, frame_index, indexed_solutions, cache=cache)
+                right_coords = node_coords_for_option(right_node, right_option, frame_index, indexed_solutions, cache=cache)
+                if coords_within_radius(left_coords, right_coords, radius):
+                    return True
+    return False
+
+
+def option_pair_overlaps_any_shared_frame(
+    left_node: TrackletNode,
+    left_option: str,
+    right_node: TrackletNode,
+    right_option: str,
+    indexed_solutions: dict[str, SolutionIndex],
+    cache: GeometryQueryCache | None = None,
+) -> bool:
+    begin = max(left_node.begin, right_node.begin)
+    end = min(left_node.end, right_node.end)
+    if begin > end:
+        return False
+    for frame_index in range(begin, end + 1):
+        left_bbox = node_bbox_for_option(left_node, left_option, frame_index, indexed_solutions, cache=cache)
+        right_bbox = node_bbox_for_option(right_node, right_option, frame_index, indexed_solutions, cache=cache)
+        if not bboxes_overlap(left_bbox, right_bbox):
+            continue
+        left_coords = node_coord_set_for_option(left_node, left_option, frame_index, indexed_solutions, cache=cache)
+        right_coords = node_coord_set_for_option(right_node, right_option, frame_index, indexed_solutions, cache=cache)
+        if left_coords and right_coords and coords_overlap(left_coords, right_coords):
+            return True
+    return False
+
+
+def temporal_boundary_iou(
+    parent: TrackletNode,
+    parent_option: str,
+    child: TrackletNode,
+    child_option: str,
+    indexed_solutions: dict[str, SolutionIndex],
+    cache: GeometryQueryCache | None = None,
+) -> float:
+    parent_coords = node_coords_for_option(parent, parent_option, parent.end, indexed_solutions, cache=cache)
+    child_coords = node_coords_for_option(child, child_option, child.begin, indexed_solutions, cache=cache)
+    return coords_iou(parent_coords, child_coords)
+
+
+def node_coords_for_option(
+    node: TrackletNode,
+    option_name: str,
+    frame_index: int,
+    indexed_solutions: dict[str, SolutionIndex],
+    cache: GeometryQueryCache | None = None,
+) -> np.ndarray:
+    cache_key = (node.node_id, option_name, frame_index)
+    if cache is not None:
+        cached = cache.coords_by_key.get(cache_key)
+        if cached is not None:
+            return cached
+    if node.is_common_supported:
+        assert node.source_names is not None and node.source_track_ids is not None
+        left_solution = indexed_solutions[node.source_names[0]]
+        right_solution = indexed_solutions[node.source_names[1]]
+        tracklet = CommonTracklet(
+            tracklet_id=node.node_id,
+            begin=node.begin,
+            end=node.end,
+            source_names=node.source_names,
+            source_track_ids=node.source_track_ids,
+        )
+        coords = common_variant_coords(option_name, tracklet, frame_index, left_solution, right_solution)
+        if cache is not None:
+            cache.coords_by_key[cache_key] = coords
+        return coords
+
+    if option_name != fixed_geometry_option(node):
+        raise ValueError(f"Source-specific node {node.node_id} only supports option '{fixed_geometry_option(node)}', found '{option_name}'.")
+    assert node.source_name is not None and node.source_track_id is not None
+    coords = track_coords(indexed_solutions[node.source_name], frame_index, node.source_track_id)
+    if cache is not None:
+        cache.coords_by_key[cache_key] = coords
+    return coords
+
+
+def node_bbox_for_option(
+    node: TrackletNode,
+    option_name: str,
+    frame_index: int,
+    indexed_solutions: dict[str, SolutionIndex],
+    *,
+    cache: GeometryQueryCache | None = None,
+) -> tuple[int, int, int, int] | None:
+    cache_key = (node.node_id, option_name, frame_index)
+    if cache is not None and cache_key in cache.bbox_by_key:
+        return cache.bbox_by_key[cache_key]
+    coords = node_coords_for_option(node, option_name, frame_index, indexed_solutions, cache=cache)
+    bbox = coords_bbox(coords)
+    if cache is not None:
+        cache.bbox_by_key[cache_key] = bbox
+    return bbox
+
+
+def node_coord_set_for_option(
+    node: TrackletNode,
+    option_name: str,
+    frame_index: int,
+    indexed_solutions: dict[str, SolutionIndex],
+    *,
+    cache: GeometryQueryCache | None = None,
+) -> frozenset[tuple[int, int]]:
+    cache_key = (node.node_id, option_name, frame_index)
+    if cache is not None and cache_key in cache.coord_set_by_key:
+        return cache.coord_set_by_key[cache_key]
+    coords = node_coords_for_option(node, option_name, frame_index, indexed_solutions, cache=cache)
+    coord_set = frozenset((int(coord[0]), int(coord[1])) for coord in np.asarray(coords, dtype=np.int32))
+    if cache is not None:
+        cache.coord_set_by_key[cache_key] = coord_set
+    return coord_set
 
 
 def decode_selected_tracklets(
@@ -1385,6 +2716,7 @@ def render_variant_masks(
     selected_nodes: set[int],
     node_to_final_track: dict[int, int],
     indexed_solutions: dict[str, SolutionIndex],
+    common_geometry_assignments: dict[int, str] | None = None,
 ) -> np.ndarray:
     tracked_masks = np.zeros((len(raw_frames), *raw_frames[0].shape), dtype=np.uint16)
     selected_node_list = list(node for node in nodes if node.node_id in selected_nodes)
@@ -1400,7 +2732,13 @@ def render_variant_masks(
     for node in selected_node_list:
         track_id = node_to_final_track[node.node_id]
         for frame_index in range(node.begin, node.end + 1):
-            coords = node_variant_coords(variant_name, node, frame_index, indexed_solutions)
+            if common_geometry_assignments is not None and node.is_common_supported:
+                assigned_option = common_geometry_assignments.get(node.node_id)
+                if assigned_option is None:
+                    raise ValueError(f"Missing geometry assignment for selected common-supported fragment {node.node_id}.")
+                coords = node_coords_for_option(node, assigned_option, frame_index, indexed_solutions)
+            else:
+                coords = node_variant_coords(variant_name, node, frame_index, indexed_solutions)
             if coords.size == 0:
                 continue
             frame_mask = tracked_masks[frame_index]
@@ -2262,6 +3600,65 @@ def union_coords(left: np.ndarray, right: np.ndarray) -> np.ndarray:
         return np.asarray(left, dtype=np.int32)
     coords = sorted({tuple(coord) for coord in np.asarray(left, dtype=np.int32)} | {tuple(coord) for coord in np.asarray(right, dtype=np.int32)})
     return np.asarray(coords, dtype=np.int32)
+
+
+def coords_bbox(coords: np.ndarray) -> tuple[int, int, int, int] | None:
+    if coords.size == 0:
+        return None
+    coords = np.asarray(coords, dtype=np.int32)
+    coord_min = np.min(coords, axis=0)
+    coord_max = np.max(coords, axis=0)
+    return (int(coord_min[0]), int(coord_min[1]), int(coord_max[0]), int(coord_max[1]))
+
+
+def bboxes_overlap(
+    left: tuple[int, int, int, int] | None,
+    right: tuple[int, int, int, int] | None,
+) -> bool:
+    if left is None or right is None:
+        return False
+    return not (left[2] < right[0] or right[2] < left[0] or left[3] < right[1] or right[3] < left[1])
+
+
+def bboxes_within_radius(
+    left: tuple[int, int, int, int] | None,
+    right: tuple[int, int, int, int] | None,
+    radius: int,
+) -> bool:
+    if radius < 0 or left is None or right is None:
+        return False
+    row_gap = max(0, left[0] - right[2], right[0] - left[2])
+    col_gap = max(0, left[1] - right[3], right[1] - left[3])
+    return row_gap * row_gap + col_gap * col_gap <= radius * radius
+
+
+def coords_overlap(
+    left: frozenset[tuple[int, int]] | set[tuple[int, int]],
+    right: frozenset[tuple[int, int]] | set[tuple[int, int]],
+) -> bool:
+    if not left or not right:
+        return False
+    if len(left) > len(right):
+        left, right = right, left
+    return any(coord in right for coord in left)
+
+
+def coords_within_radius(left: np.ndarray, right: np.ndarray, radius: int) -> bool:
+    if radius < 0 or left.size == 0 or right.size == 0:
+        return False
+    left = np.asarray(left, dtype=np.int32)
+    right = np.asarray(right, dtype=np.int32)
+    left_min = np.min(left, axis=0)
+    left_max = np.max(left, axis=0)
+    right_min = np.min(right, axis=0)
+    right_max = np.max(right, axis=0)
+    row_gap = max(0, left_min[0] - right_max[0], right_min[0] - left_max[0])
+    col_gap = max(0, left_min[1] - right_max[1], right_min[1] - left_max[1])
+    if row_gap * row_gap + col_gap * col_gap > radius * radius:
+        return False
+    row_delta = left[:, None, 0].astype(np.int64) - right[None, :, 0].astype(np.int64)
+    col_delta = left[:, None, 1].astype(np.int64) - right[None, :, 1].astype(np.int64)
+    return bool(np.any((row_delta * row_delta + col_delta * col_delta) <= radius * radius))
 
 
 def coords_iou(left: np.ndarray, right: np.ndarray) -> float:

@@ -47,23 +47,25 @@ It works as follows:
 - If the saved `embedseg` or `stardist` tracking result is missing, it first runs the missing single-source tracking job.
 - It loads both saved tracking solutions.
 - It finds shared trajectory fragments using one-to-one frame matching with `IoU >= 0.8` and matching temporal structure.
-- These shared fragments are treated as **fixed common tracklets**.
+- These shared fragments are treated as **common-supported tracklets**.
 - The remaining non-shared fragments become hypotheses.
 - It solves one **global tracklet-level ILP** over the whole sequence.
-- It exports one final lineage solution with four different mask realizations:
+- By default, it exports one final lineage solution with four different mask realizations:
   - `intersection`
   - `union`
   - `embedseg`
   - `stardist`
+- With `--common-geometry-mode two_stage` or `--common-geometry-mode joint`, it instead optimizes the geometry choice for selected common-supported fragments and exports one optimized result.
 
-The four consensus variants share the same lineage graph and differ only in how the fixed common tracklets are rendered geometrically.
+Source-specific selected fragments always keep the geometry from their own source. Common-supported selected fragments share the same lineage fragment but still need a geometry choice, because both sources provide a valid mask for that fragment.
 
 ### 3. `--evaluate-only`
 
 This is not a separate `--mode`. It is a flag that changes what `single` or `consensus` mode does.
 
 - In `single` mode, it loads one already saved source result and recomputes only the metric files.
-- In `consensus` mode, it loads the already saved consensus variants and recomputes only the pre-merge, per-variant, and comparison metric files.
+- In `consensus` mode, it loads the already saved consensus outputs and recomputes only the pre-merge, per-variant, and comparison metric files.
+- When `render_manifest.json` is present, it uses that manifest to decide which consensus variants to reevaluate.
 - It skips:
   - classifier loading and training,
   - pairwise tracking ILPs,
@@ -193,6 +195,14 @@ uv run python main.py
   - skip tracking and recompute metrics only from saved outputs
 - `--agreement-iou-threshold`
   - used in `consensus` mode, defaults to `0.8`
+- `--common-geometry-mode {posthoc,two_stage,joint}`
+  - used in `consensus` mode, defaults to `posthoc`
+- `--geometry-source-weight`
+  - weight of source-consistency agreement in optimized common-fragment geometry selection, defaults to `1.0`
+- `--geometry-temporal-overlap-weight`
+  - weight of temporal boundary overlap in optimized common-fragment geometry selection, defaults to `0.25`
+- `--geometry-neighbor-radius`
+  - radius used to build same-frame geometry neighbors in optimized common-fragment geometry selection, defaults to `5`
 - `--max-distance`
   - maximum centroid distance for move and division candidates, defaults to `50`
 - `--output-dir`
@@ -366,6 +376,28 @@ uv run python main.py \
   --consensus-sources embedseg stardist
 ```
 
+### Example: Merge With Two-Stage Common Geometry Optimization
+
+```bash
+uv run python main.py \
+  --mode consensus \
+  --dataset-root ./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa \
+  --extra-seg-root ./data/Fluo-N2DL-HeLa_train/Segmentations \
+  --consensus-sources embedseg stardist \
+  --common-geometry-mode two_stage
+```
+
+### Example: Merge With Joint Lineage And Geometry Optimization
+
+```bash
+uv run python main.py \
+  --mode consensus \
+  --dataset-root ./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa \
+  --extra-seg-root ./data/Fluo-N2DL-HeLa_train/Segmentations \
+  --consensus-sources embedseg stardist \
+  --common-geometry-mode joint
+```
+
 ### What Consensus Mode Uses
 
 Consensus mode only uses the two named **external** source results as inputs.
@@ -386,14 +418,20 @@ as source solutions for the merge.
 4. Match objects frame by frame with one-to-one IoU matching.
 5. Keep only matched object pairs with `IoU >= 0.8` by default.
 6. Build common tracklets from shared trajectory fragments.
-7. Treat these common tracklets as fixed.
+7. Treat these common-supported tracklets as shared lineage candidates.
 8. Convert the remaining fragments from both solutions into hypothesis tracklets.
 9. Solve one global tracklet-level ILP over the whole sequence.
-10. Export four final mask variants from the same lineage solution.
+10. If `--common-geometry-mode posthoc`, export four deterministic mask variants from the same lineage solution.
+11. If `--common-geometry-mode two_stage`, solve a second ILP that chooses one geometry option for each selected common-supported fragment.
+12. If `--common-geometry-mode joint`, solve one enlarged ILP that chooses lineage structure and common-fragment geometry together.
 
 ### Consensus Output Variants
 
-For fixed common tracklets, the final masks can be rendered in four ways:
+For source-specific selected fragments, the geometry always comes from the source that generated that fragment.
+
+For selected common-supported fragments, the geometry depends on `--common-geometry-mode`.
+
+If `--common-geometry-mode posthoc`, the final masks can be rendered in four deterministic ways:
 
 - `intersection`
   - pixelwise intersection of the two source masks
@@ -404,15 +442,31 @@ For fixed common tracklets, the final masks can be rendered in four ways:
 - `stardist`
   - always use the `stardist` geometry for the fixed common parts
 
-For non-common selected hypothesis fragments:
-
-- the geometry always comes from the source that generated that fragment
-
 All four consensus variants have:
 
 - the same selected lineage solution
 - the same `res_track.txt`
 - different `maskNNN.tif` files
+
+If `--common-geometry-mode two_stage`, PyTr2d exports:
+
+- `optimized_two_stage/`
+
+If `--common-geometry-mode joint`, PyTr2d exports:
+
+- `optimized_joint/`
+
+In both optimized modes, each selected common-supported fragment chooses one of:
+
+- `embedseg`
+- `stardist`
+- `intersection`
+- `union`
+
+The optimized geometry objective uses:
+
+- source-consistency agreement with neighboring fragments
+- a temporal boundary-overlap bonus on selected move and division relations
 
 ## Output Conventions
 
@@ -460,10 +514,24 @@ Contains:
 - `premerge_metrics.txt`
 - `variant_comparison.json`
 - `variant_comparison.txt`
+- `render_manifest.json`
+- variant folders, depending on `--common-geometry-mode`
+- optionally `geometry_assignments.json` for `two_stage` and `joint`
+
+With `--common-geometry-mode posthoc`, the variant folders are:
+
 - `intersection/`
 - `union/`
 - `embedseg/`
 - `stardist/`
+
+With `--common-geometry-mode two_stage`, the variant folder is:
+
+- `optimized_two_stage/`
+
+With `--common-geometry-mode joint`, the variant folder is:
+
+- `optimized_joint/`
 
 Each variant folder contains:
 
@@ -548,7 +616,7 @@ In addition, each input solution now also gets a nested `ctc_evaluation` block i
 
 ### 2. Final Variant Metrics
 
-For each final variant (`intersection`, `union`, `embedseg`, `stardist`), PyTr2d writes:
+For each rendered final variant, PyTr2d writes:
 
 - `summary_metrics`
   - number of tracks
@@ -570,7 +638,15 @@ For each final variant (`intersection`, `union`, `embedseg`, `stardist`), PyTr2d
 - `ctc_evaluation`
   - official CTC metrics when available
 
-The root-level `variant_comparison.*` files compare the four final variants side by side.
+For optimized geometry modes, each variant `metrics.*` file also includes an `optimized_geometry` block with:
+
+- counts by chosen geometry option
+- average source-consistency score
+- average temporal overlap bonus
+- the configured neighbor radius and geometry weights
+- the number of common-fragment geometry options ruled out by conflicts
+
+The root-level `variant_comparison.*` files compare whichever rendered variants are present for the current run.
 
 ## Cell Tracking Challenge Output Format
 
@@ -645,6 +721,7 @@ This means:
   - `outputs/Fluo-N2DL-HeLa/02/stardist/`
 - load the saved consensus variants from:
   - `outputs/Fluo-N2DL-HeLa/02/consensus_embedseg_stardist/`
+- if `render_manifest.json` exists, use it to discover the saved variant names
 - do not rerun pairwise tracking
 - do not rerun the consensus/global ILP
 - recompute and rewrite:

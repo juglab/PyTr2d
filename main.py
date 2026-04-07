@@ -67,6 +67,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum IoU required to consider two tracked objects common between the two source solutions.",
     )
     parser.add_argument(
+        "--common-geometry-mode",
+        default="posthoc",
+        choices=("posthoc", "two_stage", "joint"),
+        help="How to choose geometries for common fragments in consensus mode.",
+    )
+    parser.add_argument(
+        "--geometry-source-weight",
+        type=float,
+        default=1.0,
+        help="Weight of source-consistency agreement in optimized common-geometry selection.",
+    )
+    parser.add_argument(
+        "--geometry-temporal-overlap-weight",
+        type=float,
+        default=0.25,
+        help="Weight of temporal boundary-overlap bonuses in optimized common-geometry selection.",
+    )
+    parser.add_argument(
+        "--geometry-neighbor-radius",
+        type=int,
+        default=5,
+        help="Maximum pixel radius used when building same-frame geometry-neighbor pairs.",
+    )
+    parser.add_argument(
         "--max-distance",
         type=float,
         default=50.0,
@@ -162,6 +186,10 @@ def args_to_config(args: argparse.Namespace) -> TrackingConfig:
         force_retrack=args.force_retrack,
         segmentation_reward=args.segmentation_reward,
         train_iou_threshold=args.train_iou_threshold,
+        common_geometry_mode=args.common_geometry_mode,
+        geometry_source_weight=args.geometry_source_weight,
+        geometry_temporal_overlap_weight=args.geometry_temporal_overlap_weight,
+        geometry_neighbor_radius=args.geometry_neighbor_radius,
     )
 
 
@@ -224,6 +252,7 @@ def run_tracking(config: TrackingConfig) -> TrackingResult | ConsensusResult:
     else:
         LOGGER.info("Consensus source selection: %s", ", ".join(config.consensus_sources))
         LOGGER.info("Consensus output directory: %s", projectio.resolve_consensus_output_dir(config))
+        LOGGER.info("Consensus common-geometry mode: %s", config.common_geometry_mode)
     LOGGER.info("Extra segmentation root: %s", config.extra_seg_root if config.extra_seg_root else "<none>")
     LOGGER.info("Model directory root: %s", config.model_dir if config.model_dir else Path("models"))
     LOGGER.info("Log file: %s", config.log_file)
@@ -346,6 +375,10 @@ def _run_consensus_tracking(
                 force_retrack=config.force_retrack,
                 segmentation_reward=config.segmentation_reward,
                 train_iou_threshold=config.train_iou_threshold,
+                common_geometry_mode=config.common_geometry_mode,
+                geometry_source_weight=config.geometry_source_weight,
+                geometry_temporal_overlap_weight=config.geometry_temporal_overlap_weight,
+                geometry_neighbor_radius=config.geometry_neighbor_radius,
             )
             _run_single_tracking(single_config, scorers)
         else:
@@ -468,6 +501,10 @@ def main() -> int:
         print(f"Wrote variant comparison to {result.variant_comparison_path}")
         if result.diagnostics_path is not None:
             print(f"Wrote consensus diagnostics to {result.diagnostics_path}")
+        if result.render_manifest_path is not None:
+            print(f"Wrote render manifest to {result.render_manifest_path}")
+        if result.geometry_assignments_path is not None:
+            print(f"Wrote geometry assignments to {result.geometry_assignments_path}")
         for variant_name, evaluation in sorted(result.variant_evaluations.items()):
             print(f"Variant {variant_name}: {len(evaluation.mask_paths)} masks, lineage {evaluation.lineage_path}, metrics {evaluation.metrics_json_path}")
     else:

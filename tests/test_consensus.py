@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,24 +8,31 @@ from unittest import mock
 
 import numpy as np
 
+from dataio import projectio
 from dataio.projectio import build_frame_objects
 from tracking.consensus import (
     ConsensusPreparation,
     ContinuationCandidate,
     ObjectStats,
     TrackletNode,
+    build_common_overlap_candidate_pairs,
+    build_render_manifest,
     build_solution_index,
     build_continuation_candidates,
+    evaluate_saved_consensus_outputs,
     ctc_metric_deltas,
     filter_conflicting_hypotheses,
     candidate_oracle_metrics,
+    geometry_option_names,
+    geometry_source_agreement,
     gt_matches_for_nodes,
     render_variant_masks,
     summarize_fragment_graph,
     solve_consensus_tracking,
+    write_render_manifest,
 )
 from tracking.random_forest import EventScorers
-from tracking.types import CommonTracklet, ConsensusMetrics, SavedTrackingSolution, TrackingConfig
+from tracking.types import CommonTracklet, ConsensusMetrics, LineageRecord, SavedTrackingSolution, TrackingConfig
 
 
 def _gurobi_available() -> bool:
@@ -52,6 +60,97 @@ class ConstantProbabilityModel:
         probabilities[:, 0] = 1.0 - self.positive_probability
         probabilities[:, 1] = self.positive_probability
         return probabilities
+
+
+class GeometryHelperTests(unittest.TestCase):
+    def test_geometry_option_names_and_source_agreement(self) -> None:
+        source_names = ("embedseg", "stardist")
+
+        self.assertEqual(geometry_option_names(source_names), ("embedseg", "stardist", "intersection", "union"))
+        self.assertAlmostEqual(geometry_source_agreement("embedseg", "embedseg", source_names), 1.0)
+        self.assertAlmostEqual(geometry_source_agreement("embedseg", "stardist", source_names), 0.0)
+        self.assertAlmostEqual(geometry_source_agreement("embedseg", "intersection", source_names), 0.5)
+        self.assertAlmostEqual(geometry_source_agreement("intersection", "union", source_names), 1.0)
+
+    def test_common_overlap_candidates_are_pruned_by_frame_overlap(self) -> None:
+        nodes = (
+            TrackletNode(
+                node_id=0,
+                begin=0,
+                end=1,
+                fixed=False,
+                kind="common_supported",
+                source_name=None,
+                source_track_id=None,
+                source_names=("embedseg", "stardist"),
+                source_track_ids=(1, 1),
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+            ),
+            TrackletNode(
+                node_id=1,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=2,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+            ),
+            TrackletNode(
+                node_id=2,
+                begin=3,
+                end=3,
+                fixed=False,
+                kind="source_specific",
+                source_name="stardist",
+                source_track_id=3,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+            ),
+            TrackletNode(
+                node_id=3,
+                begin=1,
+                end=1,
+                fixed=False,
+                kind="common_supported",
+                source_name=None,
+                source_track_id=None,
+                source_names=("embedseg", "stardist"),
+                source_track_ids=(4, 4),
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+            ),
+            TrackletNode(
+                node_id=4,
+                begin=3,
+                end=3,
+                fixed=False,
+                kind="common_supported",
+                source_name=None,
+                source_track_id=None,
+                source_names=("embedseg", "stardist"),
+                source_track_ids=(5, 5),
+                start_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+                end_stats=ObjectStats(0.0, 0.0, 1.0, 0.0, 0.0),
+            ),
+        )
+
+        common_source_candidates, common_common_candidates = build_common_overlap_candidate_pairs(
+            nodes,
+            frame_count=4,
+            candidate_node_ids={0, 1, 2, 3, 4},
+        )
+
+        self.assertEqual(common_source_candidates[0], (1,))
+        self.assertEqual(common_source_candidates[4], (2,))
+        self.assertNotIn(3, common_source_candidates)
+        self.assertEqual(common_common_candidates, ((0, 3),))
 
 
 @unittest.skipUnless(_gurobi_available(), "Gurobi is required for consensus solver tests.")
@@ -151,6 +250,8 @@ class ConsensusSolverTests(unittest.TestCase):
             self.assertTrue(union_masks[0].exists())
             self.assertTrue(result.premerge_metrics_path.exists())
             self.assertTrue(result.variant_comparison_path.exists())
+            self.assertIsNotNone(result.render_manifest_path)
+            self.assertTrue(result.render_manifest_path.exists())
 
     def test_sparse_node_ids_do_not_break_variant_export(self) -> None:
         raw_frames = np.stack([np.ones((4, 4), dtype=np.uint16)])
@@ -715,6 +816,414 @@ class ConsensusSolverTests(unittest.TestCase):
         self.assertEqual(matches[0][1], {0})
         self.assertNotIn(2, matches[0])
 
+    def test_two_stage_mode_writes_optimized_variant_and_assignments(self) -> None:
+        raw_frames = np.stack([np.ones((4, 8), dtype=np.uint16) for _ in range(2)])
+        embedseg_solution = SavedTrackingSolution(
+            source_name="embedseg",
+            output_dir=Path("/tmp/embedseg"),
+            tracked_masks=np.stack(
+                [
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 1, 1, 3, 3, 0, 0, 0],
+                            [0, 1, 1, 3, 3, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 2, 2, 0, 0, 0, 0, 0],
+                            [0, 2, 2, 0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                ]
+            ),
+            lineage_rows=(
+                self._row(track_id=1, begin=0, end=0, parent=0),
+                self._row(track_id=2, begin=1, end=1, parent=0),
+                self._row(track_id=3, begin=0, end=0, parent=0),
+            ),
+            frames=(
+                build_frame_objects(
+                    "embedseg",
+                    0,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 1, 1, 3, 3, 0, 0, 0],
+                            [0, 1, 1, 3, 3, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[0],
+                ),
+                build_frame_objects(
+                    "embedseg",
+                    1,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 2, 2, 0, 0, 0, 0, 0],
+                            [0, 2, 2, 0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[1],
+                ),
+            ),
+            checkpoint=None,
+        )
+        stardist_solution = SavedTrackingSolution(
+            source_name="stardist",
+            output_dir=Path("/tmp/stardist"),
+            tracked_masks=np.stack(
+                [
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 0, 1, 1, 0, 0, 0, 0],
+                            [0, 0, 1, 1, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    np.zeros((4, 8), dtype=np.uint16),
+                ]
+            ),
+            lineage_rows=(self._row(track_id=1, begin=0, end=0, parent=0),),
+            frames=(
+                build_frame_objects(
+                    "stardist",
+                    0,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                            [0, 0, 1, 1, 0, 0, 0, 0],
+                            [0, 0, 1, 1, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[0],
+                ),
+                build_frame_objects("stardist", 1, np.zeros((4, 8), dtype=np.uint16), raw_frames[1]),
+            ),
+            checkpoint=None,
+        )
+        nodes = (
+            TrackletNode(
+                node_id=0,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="common_supported",
+                source_name=None,
+                source_track_id=None,
+                source_names=("embedseg", "stardist"),
+                source_track_ids=(1, 1),
+                start_stats=ObjectStats(1.5, 1.5, 4.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 1.5, 4.0, 0.0, 1.0),
+            ),
+            TrackletNode(
+                node_id=1,
+                begin=1,
+                end=1,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=2,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(1.5, 1.5, 4.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 1.5, 4.0, 0.0, 1.0),
+            ),
+            TrackletNode(
+                node_id=2,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=3,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(1.5, 3.5, 4.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 3.5, 4.0, 0.0, 1.0),
+            ),
+        )
+        preparation = ConsensusPreparation(
+            common_tracklets=(CommonTracklet(tracklet_id=0, begin=0, end=0, source_names=("embedseg", "stardist"), source_track_ids=(1, 1)),),
+            hypothesis_tracklets=(),
+            nodes=nodes,
+            matches_by_frame=(),
+            input_metrics=ConsensusMetrics(
+                agreement_metrics={},
+                input_solution_metrics={},
+                common_tracklet_count=1,
+                hypothesis_tracklet_count=2,
+            ),
+            graph_stats={},
+            oracle_metrics={},
+        )
+        scorers = self._scorers(0.9)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TrackingConfig(
+                dataset_root=Path(tmpdir) / "dataset",
+                extra_seg_root=None,
+                mode="consensus",
+                consensus_sources=("embedseg", "stardist"),
+                consensus_output_dir=Path(tmpdir) / "consensus",
+                log_file=Path(tmpdir) / "consensus" / "run.log",
+                common_geometry_mode="two_stage",
+            )
+            config.dataset_root.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch("tracking.consensus.prepare_consensus", return_value=preparation), \
+                 mock.patch(
+                     "tracking.consensus.solve_global_tracklet_ilp",
+                     return_value=(
+                         {0, 1, 2},
+                         {0: None, 1: ("move", 0), 2: None},
+                         {0: ("move", 1), 1: None, 2: None},
+                         {"selected_total_count": 3},
+                     ),
+                 ):
+                result = solve_consensus_tracking(
+                    config,
+                    raw_frames,
+                    {"embedseg": embedseg_solution, "stardist": stardist_solution},
+                    scorers,
+                )
+
+            self.assertEqual(set(result.variant_evaluations), {"optimized_two_stage"})
+            self.assertIsNotNone(result.geometry_assignments_path)
+            payload = json.loads(result.geometry_assignments_path.read_text())
+            self.assertEqual(payload["assignments"]["0"], "embedseg")
+            self.assertTrue(result.render_manifest_path.exists())
+            manifest = json.loads(result.render_manifest_path.read_text())
+            self.assertEqual(manifest["variant_names"], ["optimized_two_stage"])
+
+    def test_joint_mode_can_choose_intersection_to_keep_common_and_source_specific_fragments(self) -> None:
+        raw_frames = np.stack([np.ones((4, 6), dtype=np.uint16)])
+        embedseg_solution = SavedTrackingSolution(
+            source_name="embedseg",
+            output_dir=Path("/tmp/embedseg"),
+            tracked_masks=np.stack(
+                [
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0],
+                            [0, 1, 1, 2, 0, 0],
+                            [0, 1, 1, 2, 0, 0],
+                            [0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    )
+                ]
+            ),
+            lineage_rows=(
+                self._row(track_id=1, begin=0, end=0, parent=0),
+                self._row(track_id=2, begin=0, end=0, parent=0),
+            ),
+            frames=(
+                build_frame_objects(
+                    "embedseg",
+                    0,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0],
+                            [0, 1, 1, 2, 0, 0],
+                            [0, 1, 1, 2, 0, 0],
+                            [0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[0],
+                ),
+            ),
+            checkpoint=None,
+        )
+        stardist_solution = SavedTrackingSolution(
+            source_name="stardist",
+            output_dir=Path("/tmp/stardist"),
+            tracked_masks=np.stack(
+                [
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0],
+                            [0, 2, 1, 1, 0, 0],
+                            [0, 2, 1, 1, 0, 0],
+                            [0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    )
+                ]
+            ),
+            lineage_rows=(
+                self._row(track_id=1, begin=0, end=0, parent=0),
+                self._row(track_id=2, begin=0, end=0, parent=0),
+            ),
+            frames=(
+                build_frame_objects(
+                    "stardist",
+                    0,
+                    np.array(
+                        [
+                            [0, 0, 0, 0, 0, 0],
+                            [0, 2, 1, 1, 0, 0],
+                            [0, 2, 1, 1, 0, 0],
+                            [0, 0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    raw_frames[0],
+                ),
+            ),
+            checkpoint=None,
+        )
+        nodes = (
+            TrackletNode(
+                node_id=0,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="common_supported",
+                source_name=None,
+                source_track_id=None,
+                source_names=("embedseg", "stardist"),
+                source_track_ids=(1, 1),
+                start_stats=ObjectStats(1.5, 2.0, 4.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 2.0, 4.0, 0.0, 1.0),
+            ),
+            TrackletNode(
+                node_id=1,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="embedseg",
+                source_track_id=2,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(1.5, 3.0, 2.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 3.0, 2.0, 0.0, 1.0),
+            ),
+            TrackletNode(
+                node_id=2,
+                begin=0,
+                end=0,
+                fixed=False,
+                kind="source_specific",
+                source_name="stardist",
+                source_track_id=2,
+                source_names=None,
+                source_track_ids=None,
+                start_stats=ObjectStats(1.5, 1.0, 2.0, 0.0, 1.0),
+                end_stats=ObjectStats(1.5, 1.0, 2.0, 0.0, 1.0),
+            ),
+        )
+        preparation = ConsensusPreparation(
+            common_tracklets=(CommonTracklet(tracklet_id=0, begin=0, end=0, source_names=("embedseg", "stardist"), source_track_ids=(1, 1)),),
+            hypothesis_tracklets=(),
+            nodes=nodes,
+            matches_by_frame=(),
+            input_metrics=ConsensusMetrics(
+                agreement_metrics={},
+                input_solution_metrics={},
+                common_tracklet_count=1,
+                hypothesis_tracklet_count=2,
+            ),
+            graph_stats={},
+            oracle_metrics={},
+        )
+        scorers = self._scorers(0.9)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = TrackingConfig(
+                dataset_root=Path(tmpdir) / "dataset",
+                extra_seg_root=None,
+                mode="consensus",
+                consensus_sources=("embedseg", "stardist"),
+                consensus_output_dir=Path(tmpdir) / "consensus",
+                log_file=Path(tmpdir) / "consensus" / "run.log",
+                common_geometry_mode="joint",
+            )
+            config.dataset_root.mkdir(parents=True, exist_ok=True)
+
+            with mock.patch("tracking.consensus.prepare_consensus", return_value=preparation):
+                result = solve_consensus_tracking(
+                    config,
+                    raw_frames,
+                    {"embedseg": embedseg_solution, "stardist": stardist_solution},
+                    scorers,
+                )
+
+            self.assertEqual(set(result.variant_evaluations), {"optimized_joint"})
+            self.assertIsNotNone(result.geometry_assignments_path)
+            payload = json.loads(result.geometry_assignments_path.read_text())
+            self.assertEqual(payload["assignments"]["0"], "intersection")
+
+    def test_evaluate_only_uses_render_manifest_variant_names(self) -> None:
+        raw_frames = np.stack([np.ones((3, 3), dtype=np.uint16)])
+        embedseg_solution = self._solution(
+            "embedseg",
+            raw_frames,
+            np.stack([np.array([[0, 1, 1], [0, 1, 1], [0, 0, 0]], dtype=np.uint16)]),
+        )
+        stardist_solution = self._solution(
+            "stardist",
+            raw_frames,
+            np.stack([np.array([[0, 1, 1], [0, 1, 1], [0, 0, 0]], dtype=np.uint16)]),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_root = Path(tmpdir) / "consensus"
+            config = TrackingConfig(
+                dataset_root=Path(tmpdir) / "dataset",
+                extra_seg_root=None,
+                mode="consensus",
+                consensus_sources=("embedseg", "stardist"),
+                consensus_output_dir=output_root,
+                common_geometry_mode="two_stage",
+            )
+            config.dataset_root.mkdir(parents=True, exist_ok=True)
+            variant_name = "optimized_two_stage"
+            projectio.write_tracking_outputs(
+                output_root / variant_name,
+                embedseg_solution.tracked_masks,
+                (LineageRecord(track_id=1, begin=0, end=0, parent=0),),
+            )
+            (output_root / variant_name / "metrics.json").write_text(
+                json.dumps({"optimized_geometry": {"assignment_count_by_option": {"embedseg": 1}}}),
+                encoding="utf-8",
+            )
+            (output_root / "geometry_assignments.json").write_text("{}", encoding="utf-8")
+            write_render_manifest(
+                output_root,
+                build_render_manifest(
+                    config=config,
+                    variant_names=(variant_name,),
+                    geometry_assignments_filename="geometry_assignments.json",
+                ),
+            )
+
+            result = evaluate_saved_consensus_outputs(
+                config,
+                raw_frames,
+                {"embedseg": embedseg_solution, "stardist": stardist_solution},
+            )
+
+            self.assertEqual(set(result.variant_evaluations), {variant_name})
+            self.assertEqual(result.geometry_assignments_path, output_root / "geometry_assignments.json")
+            self.assertTrue(result.render_manifest_path.exists())
+
     def _solution(
         self,
         source_name: str,
@@ -729,15 +1238,21 @@ class ConsensusSolverTests(unittest.TestCase):
             source_name=source_name,
             output_dir=Path("/tmp") / source_name,
             tracked_masks=tracked_masks,
-            lineage_rows=(self._row(track_id=1, begin=0, end=1, parent=0),),
+            lineage_rows=(self._row(track_id=1, begin=0, end=len(tracked_masks) - 1, parent=0),),
             frames=frames,
             checkpoint=None,
         )
 
     def _row(self, track_id: int, begin: int, end: int, parent: int):
-        from tracking.types import LineageRecord
-
         return LineageRecord(track_id=track_id, begin=begin, end=end, parent=parent)
+
+    def _scorers(self, positive_probability: float) -> EventScorers:
+        return EventScorers(
+            move_model=ConstantProbabilityModel(positive_probability),
+            division_model=ConstantProbabilityModel(positive_probability),
+            appearance_model=ConstantProbabilityModel(positive_probability),
+            disappearance_model=ConstantProbabilityModel(positive_probability),
+        )
 
 
 if __name__ == "__main__":

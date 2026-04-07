@@ -26,6 +26,10 @@ class TrackingConfig:
     force_retrack: bool = False
     segmentation_reward: float = -105.0
     train_iou_threshold: float = 0.3
+    common_geometry_mode: str = "posthoc"
+    geometry_source_weight: float = 1.0
+    geometry_temporal_overlap_weight: float = 0.25
+    geometry_neighbor_radius: int = 5
 
 
 @dataclass(slots=True, frozen=True)
@@ -165,3 +169,5 @@ class ConsensusResult:
     variant_evaluations: dict[str, VariantEvaluation]
     diagnostics_path: Path | None = None
     diagnostics_text_path: Path | None = None
+    render_manifest_path: Path | None = None
+    geometry_assignments_path: Path | None = None
