@@ -84,14 +84,14 @@ class ConsensusMainFlowTests(unittest.TestCase):
             variant_comparison_path=Path("/tmp/consensus/variant_comparison.json"),
             variant_comparison_text_path=Path("/tmp/consensus/variant_comparison.txt"),
             variant_evaluations={
-                "intersection": VariantEvaluation(
-                    variant_name="intersection",
+                "optimized_joint": VariantEvaluation(
+                    variant_name="optimized_joint",
                     metrics={},
-                    output_dir=Path("/tmp/consensus/intersection"),
+                    output_dir=Path("/tmp/consensus/optimized_joint"),
                     mask_paths=(),
-                    lineage_path=Path("/tmp/consensus/intersection/res_track.txt"),
-                    metrics_json_path=Path("/tmp/consensus/intersection/metrics.json"),
-                    metrics_text_path=Path("/tmp/consensus/intersection/metrics.txt"),
+                    lineage_path=Path("/tmp/consensus/optimized_joint/res_track.txt"),
+                    metrics_json_path=Path("/tmp/consensus/optimized_joint/metrics.json"),
+                    metrics_text_path=Path("/tmp/consensus/optimized_joint/metrics.txt"),
                 )
             },
         )

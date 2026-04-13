@@ -300,6 +300,7 @@ def initialize_first_frame(
         for track_id, (source_name, object_index) in enumerate(selected_keys, start=1)
     ]
     mask = paint_track_mask(raw_frame.shape, first_frames_by_source, assignments)
+    projectio.validate_single_component_labels(mask, "tracked frame 000", kind="Tracked mask")
     return projectio.build_frame_objects("tracked", 0, mask, raw_frame)
 
 
@@ -541,6 +542,11 @@ def solve_frame_pair(
         lineage_state[track_id] = [frame_index + 1, frame_index + 1, 0]
 
     next_mask = paint_track_mask(next_raw_frame.shape, next_frames, assignments)
+    projectio.validate_single_component_labels(
+        next_mask,
+        f"tracked frame {frame_index + 1:03d}",
+        kind="Tracked mask",
+    )
     next_frame = projectio.build_frame_objects("tracked", frame_index + 1, next_mask, next_raw_frame)
     LOGGER.info(
         "Pair %03d -> %03d decoded: moves=%s, divisions=%s, appearances=%s, disappearances=%s, cumulative tracks=%s.",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import ExitStack
 import logging
 from pathlib import Path
 import shutil
@@ -33,65 +34,72 @@ def evaluate_result_with_ctc(gt_dir: Path, res_dir: Path) -> dict[str, object]:
         payload["reason"] = f"Result directory does not exist: {res_dir}"
         return payload
 
-    with tempfile.TemporaryDirectory(prefix="ctc_eval_", dir=str(res_dir)) as tmpdir:
-        csv_path = Path(tmpdir) / "ctc_metrics.csv"
-        command = [
-            executable,
-            "--gt",
-            str(gt_dir),
-            "--res",
-            str(res_dir),
-            "--csv-file",
-            str(csv_path),
-            "--num-threads",
-            "1",
-            "--valid",
-            "--det",
-            "--seg",
-            "--tra",
-            "--lnk",
-            "--ct",
-            "--tf",
-            "--bc",
-            "0",
-            "--cca",
-        ]
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        payload["command"] = command
-        payload["returncode"] = int(completed.returncode)
-        if completed.stdout.strip():
-            payload["stdout"] = completed.stdout.strip()
-        if completed.stderr.strip():
-            payload["stderr"] = completed.stderr.strip()
+    with ExitStack() as stack:
+        effective_gt_dir = _prepare_gt_dir_for_ctc(gt_dir, res_dir, payload, stack)
+        with tempfile.TemporaryDirectory(prefix="ctc_eval_", dir=str(res_dir)) as tmpdir:
+            csv_path = Path(tmpdir) / "ctc_metrics.csv"
+            command = [
+                executable,
+                "--gt",
+                str(effective_gt_dir),
+                "--res",
+                str(res_dir),
+                "--csv-file",
+                str(csv_path),
+                "--num-threads",
+                "1",
+                "--valid",
+                "--det",
+                "--seg",
+                "--tra",
+                "--lnk",
+                "--ct",
+                "--tf",
+                "--bc",
+                "0",
+                "--cca",
+            ]
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload["command"] = command
+            payload["returncode"] = int(completed.returncode)
+            if completed.stdout.strip():
+                payload["stdout"] = completed.stdout.strip()
+            if completed.stderr.strip():
+                payload["stderr"] = completed.stderr.strip()
 
-        if csv_path.exists():
-            metrics = _read_metrics_csv(csv_path)
-            if metrics:
-                payload["status"] = "success"
-                payload["metrics"] = _derive_metrics(metrics)
-                return payload
+            if csv_path.exists():
+                metrics = _read_metrics_csv(csv_path)
+                if metrics:
+                    payload["status"] = "success"
+                    payload["metrics"] = _derive_metrics(metrics)
+                    return payload
 
-        payload["status"] = "failed"
-        payload["reason"] = (
-            "ctc_evaluate did not produce a readable CSV result."
-            if completed.returncode == 0
-            else f"ctc_evaluate exited with code {completed.returncode}."
-        )
-        return payload
+            payload["status"] = "failed"
+            payload["reason"] = (
+                "ctc_evaluate did not produce a readable CSV result."
+                if completed.returncode == 0
+                else f"ctc_evaluate exited with code {completed.returncode}."
+            )
+            return payload
 
 
 def find_ctc_evaluate_executable() -> str | None:
     discovered = shutil.which("ctc_evaluate")
     if discovered is not None:
         return discovered
-    sibling = Path(sys.executable).resolve().with_name("ctc_evaluate")
-    if sibling.exists():
-        return str(sibling)
+    candidates = (
+        Path(sys.executable).with_name("ctc_evaluate"),
+        Path(sys.prefix) / "bin" / "ctc_evaluate",
+        Path(sys.executable).resolve().with_name("ctc_evaluate"),
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
     return None
 
 
@@ -121,12 +129,52 @@ def log_ctc_evaluation(label: str, payload: dict[str, object]) -> None:
     )
 
 
+def _prepare_gt_dir_for_ctc(
+    gt_dir: Path,
+    res_dir: Path,
+    payload: dict[str, object],
+    stack: ExitStack,
+) -> Path:
+    gt_lineage_path = gt_dir / "TRA" / "man_track.txt"
+    if gt_lineage_path.exists():
+        return gt_dir
+
+    legacy_lineage_path = gt_dir / "TRA" / "res_track.txt"
+    if not legacy_lineage_path.exists():
+        return gt_dir
+
+    overlay_dir = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="ctc_gt_", dir=str(res_dir))))
+    shutil.copytree(gt_dir, overlay_dir, dirs_exist_ok=True)
+    shutil.copyfile(legacy_lineage_path, overlay_dir / "TRA" / "man_track.txt")
+    payload["gt_lineage_fallback"] = "TRA/res_track.txt"
+    LOGGER.warning(
+        "CTC GT under %s is missing TRA/man_track.txt; using TRA/res_track.txt as a compatibility fallback.",
+        gt_dir,
+    )
+    return overlay_dir
+
+
 def _read_metrics_csv(csv_path: Path) -> dict[str, object]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
+        sample = handle.read(4096)
+        if not sample.strip():
+            return {}
+        handle.seek(0)
+        dialect = csv.get_dialect("excel")
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+        except csv.Error:
+            pass
+        reader = csv.DictReader(handle, dialect=dialect)
         row = next(reader, None)
     if row is None:
         return {}
+    if len(row) == 1:
+        only_key, only_value = next(iter(row.items()))
+        if only_key is not None and only_value is not None and ";" in only_key and ";" in only_value:
+            split_keys = [item.strip() for item in only_key.split(";")]
+            split_values = [item.strip() for item in only_value.split(";")]
+            row = dict(zip(split_keys, split_values, strict=False))
     metrics: dict[str, object] = {}
     for key, value in row.items():
         if key is None or value is None or value == "":

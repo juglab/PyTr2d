@@ -8,7 +8,7 @@ import numpy as np
 import tifffile
 
 from dataio import projectio
-from tracking.types import LineageRecord, TrackingCheckpoint, TrackingConfig
+from tracking.types import LineageRecord, SegmentationSource, TrackingCheckpoint, TrackingConfig
 
 
 class ProjectIOTests(unittest.TestCase):
@@ -56,6 +56,38 @@ class ProjectIOTests(unittest.TestCase):
             source = projectio.discover_segmentation_sources(dataset_root, "02")["st"]
             with self.assertRaises(ValueError):
                 projectio.load_source_frame_objects(source, raw_frames)
+
+    def test_load_source_frame_objects_splits_disconnected_source_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dataset_root = tmp / "Fluo-N2DL-HeLa"
+            raw_dir = dataset_root / "02"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            tifffile.imwrite(raw_dir / "t000.tif", np.ones((4, 4), dtype=np.uint16))
+
+            source_dir = tmp / "Segmentations" / "embedseg"
+            source_dir.mkdir(parents=True, exist_ok=True)
+            disconnected = np.zeros((4, 4), dtype=np.uint16)
+            disconnected[0, 0] = 5
+            disconnected[3, 3] = 5
+            tifffile.imwrite(source_dir / "mask000.tif", disconnected)
+
+            raw_frames = projectio.load_raw_sequence(dataset_root, "02")
+            source = SegmentationSource(
+                name="embedseg",
+                sequence="02",
+                frame_paths=(source_dir / "mask000.tif",),
+                frame_count=1,
+                shape=(4, 4),
+                training_capable=False,
+            )
+
+            frames = projectio.load_source_frame_objects(source, raw_frames)
+
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(frames[0].object_count, 2)
+            self.assertEqual(projectio.disconnected_label_components(frames[0].label_image), ())
+            self.assertEqual(sorted(frames[0].areas), [1, 1])
 
     def test_write_tracking_outputs_uses_ctc_filenames(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -147,6 +179,115 @@ class ProjectIOTests(unittest.TestCase):
             self.assertEqual(solution.frames[1].frame_index, 1)
             self.assertEqual(solution.frames[0].raw_label_ids, (1,))
             self.assertEqual(len(solution.lineage_rows), 1)
+
+    def test_load_saved_tracking_solution_rejects_disconnected_saved_masks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            raw_frames = np.stack([np.ones((4, 4), dtype=np.uint16)])
+            invalid_mask = np.zeros((4, 4), dtype=np.uint16)
+            invalid_mask[0, 0] = 1
+            invalid_mask[3, 3] = 1
+            tifffile.imwrite(output_dir / "mask000.tif", invalid_mask)
+            projectio.write_lineage_rows(output_dir, (LineageRecord(track_id=1, begin=0, end=0, parent=0),))
+            projectio.write_tracking_checkpoint(
+                output_dir,
+                TrackingCheckpoint(
+                    version=1,
+                    dataset_root="/tmp/demo",
+                    track_sequence="02",
+                    seg_source="stardist",
+                    selected_sources=("stardist",),
+                    frame_count=1,
+                    frame_shape=(4, 4),
+                    completed_frame=0,
+                    next_track_id=2,
+                    max_distance=50.0,
+                    segmentation_reward=-105.0,
+                    lineage_state={1: (0, 0, 0)},
+                ),
+            )
+
+            with self.assertRaisesRegex(ValueError, "disconnected label ids"):
+                projectio.load_saved_tracking_solution("stardist", output_dir, raw_frames)
+
+    def test_load_gt_frame_objects_rejects_disconnected_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dataset_root = tmp / "Fluo-N2DL-HeLa"
+            self._write_sequence(dataset_root / "02", "t", 1)
+            gt_dir = dataset_root / "02_GT" / "TRA"
+            gt_dir.mkdir(parents=True, exist_ok=True)
+            invalid_mask = np.zeros((4, 4), dtype=np.uint16)
+            invalid_mask[0, 0] = 1
+            invalid_mask[3, 3] = 1
+            tifffile.imwrite(gt_dir / "man_track000.tif", invalid_mask)
+
+            raw_frames = projectio.load_raw_sequence(dataset_root, "02")
+
+            with self.assertRaisesRegex(ValueError, "disconnected label ids"):
+                projectio.load_gt_frame_objects(dataset_root, "02", raw_frames)
+
+    def test_load_gt_tracking_reference_ignores_disconnected_track_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dataset_root = tmp / "Fluo-N2DL-HeLa"
+            self._write_sequence(dataset_root / "02", "t", 2)
+            gt_dir = dataset_root / "02_GT" / "TRA"
+            gt_dir.mkdir(parents=True, exist_ok=True)
+
+            invalid_mask = np.zeros((4, 4), dtype=np.uint16)
+            invalid_mask[0, 0] = 1
+            invalid_mask[3, 3] = 1
+            tifffile.imwrite(gt_dir / "man_track000.tif", invalid_mask)
+
+            valid_mask = np.zeros((4, 4), dtype=np.uint16)
+            valid_mask[1:3, 1:3] = 2
+            tifffile.imwrite(gt_dir / "man_track001.tif", valid_mask)
+
+            (gt_dir / "man_track.txt").write_text("1 0 0 0\n2 1 1 1\n", encoding="utf-8")
+
+            raw_frames = projectio.load_raw_sequence(dataset_root, "02")
+            frames, lineage_records = projectio.load_gt_tracking_reference(
+                dataset_root,
+                "02",
+                raw_frames,
+                ignore_disconnected_tracks=True,
+            )
+
+            self.assertEqual(len(frames), 2)
+            self.assertEqual(frames[0].object_count, 0)
+            self.assertEqual(frames[1].raw_label_ids, (2,))
+            self.assertEqual(sorted(lineage_records), [2])
+            self.assertEqual(lineage_records[2], LineageRecord(track_id=2, begin=1, end=1, parent=0))
+
+    def test_load_lineage_records_falls_back_to_res_track_for_toy_gt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            dataset_root = tmp / "Fluo-N2DL-HeLa"
+            gt_dir = dataset_root / "02_GT" / "TRA"
+            gt_dir.mkdir(parents=True, exist_ok=True)
+            (gt_dir / "res_track.txt").write_text("7 0 1 0\n9 2 3 7\n", encoding="utf-8")
+
+            records = projectio.load_lineage_records(dataset_root, "02")
+
+            self.assertEqual(sorted(records), [7, 9])
+            self.assertEqual(records[7], LineageRecord(track_id=7, begin=0, end=1, parent=0))
+            self.assertEqual(records[9], LineageRecord(track_id=9, begin=2, end=3, parent=7))
+
+    def test_toy_mask007_outputs_keep_track_ids_connected(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        mask_paths = (
+            repo_root / "outputs" / "Fluo-N2DL-HeLa" / "toy" / "embedseg" / "mask007.tif",
+            repo_root / "outputs" / "Fluo-N2DL-HeLa" / "toy" / "stardist" / "mask007.tif",
+            repo_root / "outputs" / "Fluo-N2DL-HeLa" / "toy" / "consensus_embedseg_stardist_joint" / "optimized_joint" / "mask007.tif",
+            repo_root / "outputs" / "Fluo-N2DL-HeLa" / "toy" / "consensus_embedseg_stardist_two_stage" / "optimized_two_stage" / "mask007.tif",
+        )
+        if not all(path.exists() for path in mask_paths):
+            self.skipTest("Toy regression outputs are not available in this workspace.")
+
+        for path in mask_paths:
+            image = tifffile.imread(path)
+            self.assertEqual(projectio.disconnected_label_components(image), (), str(path))
 
     def _write_sequence(self, directory: Path, prefix: str, frame_count: int) -> None:
         directory.mkdir(parents=True, exist_ok=True)

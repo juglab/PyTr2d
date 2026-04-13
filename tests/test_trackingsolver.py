@@ -164,6 +164,50 @@ class TrackingSolverTests(unittest.TestCase):
         self.assertEqual(result.lineage_rows[0].end, 1)
         self.assertEqual(result.lineage_rows[0].parent, 0)
 
+    def test_solver_rejects_disconnected_next_object_geometry(self) -> None:
+        scorers = EventScorers(
+            move_model=ConstantProbabilityModel(0.99),
+            division_model=ConstantProbabilityModel(0.01),
+            appearance_model=ConstantProbabilityModel(0.01),
+            disappearance_model=ConstantProbabilityModel(0.01),
+        )
+        raw_frames = self._raw_stack(2, (5, 5))
+        frames_by_source = {
+            "st": [
+                self._frame(
+                    "st",
+                    np.array(
+                        [
+                            [0, 1, 1, 0, 0],
+                            [0, 1, 1, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    0,
+                ),
+                self._frame(
+                    "st",
+                    np.array(
+                        [
+                            [0, 1, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 0],
+                            [0, 0, 0, 0, 1],
+                        ],
+                        dtype=np.uint16,
+                    ),
+                    1,
+                ),
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "disconnected label ids"):
+            solve_tracking(TrackingConfig(dataset_root=Path("."), extra_seg_root=None), raw_frames, frames_by_source, scorers)
+
     def test_solver_resumes_from_saved_checkpoint(self) -> None:
         scorers = EventScorers(
             move_model=ConstantProbabilityModel(0.99),

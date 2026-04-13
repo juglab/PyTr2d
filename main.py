@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from dataio import projectio
-from tracking.consensus import evaluate_saved_consensus_outputs, solve_consensus_tracking
+from tracking.consensus import effective_common_geometry_mode, evaluate_saved_consensus_outputs, solve_consensus_tracking
 from tracking.ctc_evaluation import evaluate_result_with_ctc, log_ctc_evaluation
 from tracking.random_forest import (
     EventScorers,
@@ -68,9 +68,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--common-geometry-mode",
-        default="posthoc",
+        default="joint",
         choices=("posthoc", "two_stage", "joint"),
-        help="How to choose geometries for common fragments in consensus mode.",
+        help="Deprecated compatibility flag. Consensus now always uses the joint tracklet-and-geometry ILP, so non-joint values are normalized to 'joint'.",
     )
     parser.add_argument(
         "--geometry-source-weight",
@@ -95,6 +95,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=50.0,
         help="Maximum centroid distance for move and division candidates.",
+    )
+    parser.add_argument(
+        "--consensus-division-persistence-reward",
+        type=float,
+        default=5.0,
+        help="Persistence reward subtracted from consensus division costs for stable daughters.",
+    )
+    parser.add_argument(
+        "--consensus-short-interior-penalty",
+        type=float,
+        default=4.0,
+        help="Extra appearance/disappearance penalty for short interior consensus fragments.",
+    )
+    parser.add_argument(
+        "--consensus-short-fragment-max-length",
+        type=int,
+        default=2,
+        help="Maximum fragment length considered short when penalizing interior births and deaths.",
     )
     parser.add_argument(
         "--output-dir",
@@ -167,6 +185,7 @@ def args_to_config(args: argparse.Namespace) -> TrackingConfig:
         default_log_root = output_dir if output_dir is not None else Path("outputs") / dataset_root.name / args.track_sequence / args.seg_source
     log_file = Path(args.log_file).expanduser().resolve() if args.log_file else default_log_root / "run.log"
     model_dir = Path(args.model_dir).expanduser().resolve() if args.model_dir else None
+    common_geometry_mode = effective_common_geometry_mode(args.common_geometry_mode)
     return TrackingConfig(
         dataset_root=dataset_root,
         extra_seg_root=extra_seg_root,
@@ -186,10 +205,13 @@ def args_to_config(args: argparse.Namespace) -> TrackingConfig:
         force_retrack=args.force_retrack,
         segmentation_reward=args.segmentation_reward,
         train_iou_threshold=args.train_iou_threshold,
-        common_geometry_mode=args.common_geometry_mode,
+        common_geometry_mode=common_geometry_mode,
         geometry_source_weight=args.geometry_source_weight,
         geometry_temporal_overlap_weight=args.geometry_temporal_overlap_weight,
         geometry_neighbor_radius=args.geometry_neighbor_radius,
+        consensus_division_persistence_reward=args.consensus_division_persistence_reward,
+        consensus_short_interior_penalty=args.consensus_short_interior_penalty,
+        consensus_short_fragment_max_length=args.consensus_short_fragment_max_length,
     )
 
 
@@ -250,9 +272,16 @@ def run_tracking(config: TrackingConfig) -> TrackingResult | ConsensusResult:
         LOGGER.info("Segmentation source selection: %s", config.seg_source)
         LOGGER.info("Output directory: %s", projectio.resolve_output_dir(config))
     else:
+        effective_geometry_mode = effective_common_geometry_mode(config.common_geometry_mode)
+        if config.common_geometry_mode != effective_geometry_mode:
+            LOGGER.info(
+                "Requested consensus common-geometry mode '%s' will be normalized to '%s'.",
+                config.common_geometry_mode,
+                effective_geometry_mode,
+            )
         LOGGER.info("Consensus source selection: %s", ", ".join(config.consensus_sources))
         LOGGER.info("Consensus output directory: %s", projectio.resolve_consensus_output_dir(config))
-        LOGGER.info("Consensus common-geometry mode: %s", config.common_geometry_mode)
+        LOGGER.info("Consensus common-geometry mode: %s", effective_geometry_mode)
     LOGGER.info("Extra segmentation root: %s", config.extra_seg_root if config.extra_seg_root else "<none>")
     LOGGER.info("Model directory root: %s", config.model_dir if config.model_dir else Path("models"))
     LOGGER.info("Log file: %s", config.log_file)
@@ -375,10 +404,13 @@ def _run_consensus_tracking(
                 force_retrack=config.force_retrack,
                 segmentation_reward=config.segmentation_reward,
                 train_iou_threshold=config.train_iou_threshold,
-                common_geometry_mode=config.common_geometry_mode,
+                common_geometry_mode=effective_common_geometry_mode(config.common_geometry_mode),
                 geometry_source_weight=config.geometry_source_weight,
                 geometry_temporal_overlap_weight=config.geometry_temporal_overlap_weight,
                 geometry_neighbor_radius=config.geometry_neighbor_radius,
+                consensus_division_persistence_reward=config.consensus_division_persistence_reward,
+                consensus_short_interior_penalty=config.consensus_short_interior_penalty,
+                consensus_short_fragment_max_length=config.consensus_short_fragment_max_length,
             )
             _run_single_tracking(single_config, scorers)
         else:
@@ -433,6 +465,12 @@ def _fit_event_scorers(
     if not training_sources:
         raise ValueError("No training-capable segmentation sources were found for the training sequence.")
     LOGGER.info("Training sources: %s", ", ".join(sorted(training_sources)))
+    LOGGER.info(
+        "Training-capable CTC segmentation sources come from %s_ST/SEG and %s_ERR_SEG; GT supervision comes from %s_GT/TRA.",
+        config.train_sequence,
+        config.train_sequence,
+        config.train_sequence,
+    )
 
     LOGGER.info("Loading training segmentation objects.")
     training_frames_by_source = {
@@ -440,8 +478,12 @@ def _fit_event_scorers(
         for name, source in training_sources.items()
     }
     LOGGER.info("Loading training GT tracking masks and lineage.")
-    gt_frames = projectio.load_gt_frame_objects(config.dataset_root, config.train_sequence, train_raw_frames)
-    lineage_records = projectio.load_lineage_records(config.dataset_root, config.train_sequence)
+    gt_frames, lineage_records = projectio.load_gt_tracking_reference(
+        config.dataset_root,
+        config.train_sequence,
+        train_raw_frames,
+        ignore_disconnected_tracks=True,
+    )
 
     LOGGER.info("Building and fitting event scorers.")
     return trainer.fit(training_frames_by_source, gt_frames, lineage_records)

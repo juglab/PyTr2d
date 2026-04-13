@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 import tifffile
 from skimage.measure import regionprops
 
@@ -21,6 +22,7 @@ from tracking.types import (
 
 TIFF_SUFFIXES = {".tif", ".tiff"}
 CHECKPOINT_FILENAME = "tracking_checkpoint.json"
+CONNECTED_COMPONENT_STRUCTURE = np.ones((3, 3), dtype=np.uint8)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -157,6 +159,15 @@ def load_source_frame_objects(source: SegmentationSource, raw_frames: np.ndarray
                 f"Segmentation frame {frame_path} has shape {label_image.shape}, "
                 f"expected {expected_shape}."
             )
+        label_image, split_labels = normalize_source_label_image(label_image)
+        if split_labels:
+            LOGGER.warning(
+                "Normalized source '%s' frame %03d (%s) by splitting disconnected label ids: %s.",
+                source.name,
+                frame_index,
+                frame_path.name,
+                _format_component_count_summary(split_labels),
+            )
         frame_objects = build_frame_objects(source.name, frame_index, label_image, raw_frame)
         LOGGER.debug(
             "Loaded %s frame %03d from %s with %s object(s).",
@@ -179,6 +190,40 @@ def load_source_frame_objects(source: SegmentationSource, raw_frames: np.ndarray
 
 
 def load_gt_frame_objects(dataset_root: Path, sequence: str, raw_frames: np.ndarray) -> list[FrameObjects]:
+    return load_gt_tracking_reference(dataset_root, sequence, raw_frames)[0]
+
+
+def load_gt_tracking_reference(
+    dataset_root: Path,
+    sequence: str,
+    raw_frames: np.ndarray,
+    *,
+    ignore_disconnected_tracks: bool = False,
+) -> tuple[list[FrameObjects], dict[int, LineageRecord]]:
+    ignored_track_ids: frozenset[int] = frozenset()
+    if ignore_disconnected_tracks:
+        ignored_track_ids = disconnected_gt_track_ids(dataset_root, sequence)
+        if ignored_track_ids:
+            LOGGER.warning(
+                "Ignoring %s GT track id(s) with disconnected components in sequence %s: %s.",
+                len(ignored_track_ids),
+                sequence,
+                _format_label_id_summary(tuple(sorted(ignored_track_ids))),
+            )
+
+    return (
+        _load_gt_frame_objects(dataset_root, sequence, raw_frames, ignored_track_ids=ignored_track_ids),
+        load_lineage_records(dataset_root, sequence, ignored_track_ids=ignored_track_ids),
+    )
+
+
+def _load_gt_frame_objects(
+    dataset_root: Path,
+    sequence: str,
+    raw_frames: np.ndarray,
+    *,
+    ignored_track_ids: frozenset[int] = frozenset(),
+) -> list[FrameObjects]:
     tracking_dir = dataset_root / f"{sequence}_GT" / "TRA"
     paths = sorted_tiff_paths(tracking_dir)
     if not paths:
@@ -199,6 +244,9 @@ def load_gt_frame_objects(dataset_root: Path, sequence: str, raw_frames: np.ndar
             raise ValueError(
                 f"Tracking GT frame {frame_path} has shape {label_image.shape}, expected {expected_shape}."
             )
+        if ignored_track_ids:
+            label_image = remove_label_ids(label_image, ignored_track_ids)
+        validate_single_component_labels(label_image, frame_path, kind="Tracking GT frame")
         frame_objects = build_frame_objects("gt", frame_index, label_image, raw_frame)
         LOGGER.debug(
             "Loaded GT frame %03d from %s with %s object(s).",
@@ -211,10 +259,24 @@ def load_gt_frame_objects(dataset_root: Path, sequence: str, raw_frames: np.ndar
     return frames
 
 
-def load_lineage_records(dataset_root: Path, sequence: str) -> dict[int, LineageRecord]:
-    lineage_path = dataset_root / f"{sequence}_GT" / "TRA" / "man_track.txt"
+def load_lineage_records(
+    dataset_root: Path,
+    sequence: str,
+    *,
+    ignored_track_ids: frozenset[int] = frozenset(),
+) -> dict[int, LineageRecord]:
+    tracking_dir = dataset_root / f"{sequence}_GT" / "TRA"
+    lineage_path = tracking_dir / "man_track.txt"
     if not lineage_path.exists():
-        raise ValueError(f"Missing lineage file: {lineage_path}")
+        legacy_lineage_path = tracking_dir / "res_track.txt"
+        if legacy_lineage_path.exists():
+            LOGGER.warning(
+                "Tracking GT under %s is missing man_track.txt; falling back to legacy res_track.txt.",
+                tracking_dir,
+            )
+            lineage_path = legacy_lineage_path
+        else:
+            raise ValueError(f"Missing lineage file: {lineage_path}")
 
     LOGGER.info("Loading lineage records from %s.", lineage_path)
     records: dict[int, LineageRecord] = {}
@@ -225,6 +287,31 @@ def load_lineage_records(dataset_root: Path, sequence: str) -> dict[int, Lineage
                 continue
             track_id, begin, end, parent = (int(value) for value in stripped.split())
             records[track_id] = LineageRecord(track_id=track_id, begin=begin, end=end, parent=parent)
+    if ignored_track_ids:
+        filtered: dict[int, LineageRecord] = {}
+        detached_children = 0
+        for track_id, record in records.items():
+            if track_id in ignored_track_ids:
+                continue
+            parent = record.parent
+            if parent in ignored_track_ids:
+                parent = 0
+                detached_children += 1
+            filtered[track_id] = LineageRecord(
+                track_id=record.track_id,
+                begin=record.begin,
+                end=record.end,
+                parent=parent,
+            )
+        records = filtered
+        LOGGER.info(
+            "Loaded %s lineage record(s) for sequence %s after dropping %s ignored GT track id(s) and detaching %s child track(s).",
+            len(records),
+            sequence,
+            len(ignored_track_ids),
+            detached_children,
+        )
+        return records
     LOGGER.info("Loaded %s lineage record(s).", len(records))
     return records
 
@@ -262,6 +349,102 @@ def build_frame_objects(
     )
 
 
+def normalize_source_label_image(label_image: np.ndarray) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+    normalized = np.zeros(label_image.shape, dtype=np.uint32)
+    split_labels: list[tuple[int, int]] = []
+    next_label_id = max((int(value) for value in np.unique(label_image) if int(value) > 0), default=0) + 1
+
+    for raw_label_id in sorted(int(value) for value in np.unique(label_image) if int(value) > 0):
+        components, component_count = ndimage.label(
+            label_image == raw_label_id,
+            structure=CONNECTED_COMPONENT_STRUCTURE,
+        )
+        if component_count == 0:
+            continue
+        if component_count > 1:
+            split_labels.append((raw_label_id, int(component_count)))
+        for component_id in range(1, int(component_count) + 1):
+            assigned_label_id = raw_label_id if component_id == 1 else next_label_id
+            normalized[components == component_id] = assigned_label_id
+            if component_id > 1:
+                next_label_id += 1
+
+    if normalized.size == 0 or int(np.max(normalized)) <= np.iinfo(np.uint16).max:
+        normalized = normalized.astype(np.uint16, copy=False)
+    return normalized, tuple(split_labels)
+
+
+def disconnected_gt_track_ids(dataset_root: Path, sequence: str) -> frozenset[int]:
+    tracking_dir = dataset_root / f"{sequence}_GT" / "TRA"
+    paths = sorted_tiff_paths(tracking_dir)
+    if not paths:
+        return frozenset()
+
+    disconnected_ids: set[int] = set()
+    for frame_path in paths:
+        label_image = np.asarray(tifffile.imread(frame_path))
+        _validate_2d_image(label_image, frame_path)
+        disconnected_ids.update(label_id for label_id, _component_count in disconnected_label_components(label_image))
+    return frozenset(disconnected_ids)
+
+
+def remove_label_ids(label_image: np.ndarray, ignored_track_ids: frozenset[int]) -> np.ndarray:
+    if not ignored_track_ids:
+        return np.asarray(label_image)
+    removal_mask = np.isin(label_image, tuple(sorted(ignored_track_ids)))
+    if not np.any(removal_mask):
+        return np.asarray(label_image)
+    cleaned = np.asarray(label_image).copy()
+    cleaned[removal_mask] = 0
+    return cleaned
+
+
+def validate_single_component_labels(
+    label_image: np.ndarray,
+    label_source: str | Path,
+    *,
+    kind: str = "Label image",
+) -> None:
+    disconnected = disconnected_label_components(label_image)
+    if not disconnected:
+        return
+    raise ValueError(
+        f"{kind} {label_source} contains disconnected label ids: "
+        f"{_format_component_count_summary(disconnected)}. "
+        "Each non-zero label must map to exactly one connected component."
+    )
+
+
+def disconnected_label_components(label_image: np.ndarray) -> tuple[tuple[int, int], ...]:
+    disconnected: list[tuple[int, int]] = []
+    for raw_label_id in sorted(int(value) for value in np.unique(label_image) if int(value) > 0):
+        _components, component_count = ndimage.label(
+            label_image == raw_label_id,
+            structure=CONNECTED_COMPONENT_STRUCTURE,
+        )
+        if component_count > 1:
+            disconnected.append((raw_label_id, int(component_count)))
+    return tuple(disconnected)
+
+
+def _format_component_count_summary(disconnected: tuple[tuple[int, int], ...] | list[tuple[int, int]]) -> str:
+    preview = list(disconnected)[:10]
+    summary = ", ".join(f"{label_id} ({component_count} components)" for label_id, component_count in preview)
+    remaining = len(disconnected) - len(preview)
+    if remaining > 0:
+        summary += f", and {remaining} more"
+    return summary
+
+
+def _format_label_id_summary(label_ids: tuple[int, ...]) -> str:
+    preview = list(label_ids)[:10]
+    summary = ", ".join(str(label_id) for label_id in preview)
+    remaining = len(label_ids) - len(preview)
+    if remaining > 0:
+        summary += f", and {remaining} more"
+    return summary
+
+
 def write_tracking_outputs(
     output_dir: Path,
     tracked_masks: np.ndarray,
@@ -288,6 +471,7 @@ def write_tracking_outputs(
 def write_tracking_mask(output_dir: Path, frame_index: int, mask: np.ndarray) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     mask_path = output_dir / f"mask{frame_index:03d}.tif"
+    validate_single_component_labels(mask, mask_path, kind="Tracked mask")
     tifffile.imwrite(mask_path, np.asarray(mask, dtype=np.uint16))
     LOGGER.debug("Wrote tracked mask %s.", mask_path.name)
     return mask_path
@@ -299,6 +483,7 @@ def load_tracking_mask(output_dir: Path, frame_index: int) -> np.ndarray:
         raise ValueError(f"Missing tracked mask for frame {frame_index}: {mask_path}")
     image = np.asarray(tifffile.imread(mask_path))
     _validate_2d_image(image, mask_path)
+    validate_single_component_labels(image, mask_path, kind="Saved tracked mask")
     return image
 
 
@@ -367,9 +552,14 @@ def load_saved_tracking_solution(
     return solution
 
 
-def write_lineage_rows(output_dir: Path, lineage_rows: tuple[LineageRecord, ...]) -> Path:
+def write_lineage_rows(
+    output_dir: Path,
+    lineage_rows: tuple[LineageRecord, ...],
+    *,
+    filename: str = "res_track.txt",
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    lineage_path = output_dir / "res_track.txt"
+    lineage_path = output_dir / filename
     with lineage_path.open("w", encoding="utf-8") as handle:
         for row in lineage_rows:
             handle.write(f"{row.track_id} {row.begin} {row.end} {row.parent}\n")

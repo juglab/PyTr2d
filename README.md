@@ -49,13 +49,10 @@ It works as follows:
 - It finds shared trajectory fragments using one-to-one frame matching with `IoU >= 0.8` and matching temporal structure.
 - These shared fragments are treated as **common-supported tracklets**.
 - The remaining non-shared fragments become hypotheses.
-- It solves one **global tracklet-level ILP** over the whole sequence.
-- By default, it exports one final lineage solution with four different mask realizations:
-  - `intersection`
-  - `union`
-  - `embedseg`
-  - `stardist`
-- With `--common-geometry-mode two_stage` or `--common-geometry-mode joint`, it instead optimizes the geometry choice for selected common-supported fragments and exports one optimized result.
+- It solves one **joint tracklet-and-geometry ILP** over the whole sequence.
+- The joint ILP includes both tracklet-selection variables and common-fragment segmentation-choice variables.
+- It exports one optimized result:
+  - `optimized_joint`
 
 Source-specific selected fragments always keep the geometry from their own source. Common-supported selected fragments share the same lineage fragment but still need a geometry choice, because both sources provide a valid mask for that fragment.
 
@@ -175,6 +172,16 @@ The main entrypoint is:
 uv run python main.py
 ```
 
+If you want to clean an external segmentation folder before tracking, you can also run:
+
+```bash
+uv run python normalize_instance_masks.py \
+  --input-dir data/Fluo-N2DL-HeLa_train/Segmentations/embedseg \
+  --output-dir data/Fluo-N2DL-HeLa_train/Segmentations/embedseg_clean
+```
+
+This script splits disconnected components that accidentally share the same label id inside a frame and writes a cleaned instance mask for each frame. By default it relabels each frame sequentially from `1..N`, which is often easier to inspect before tracking.
+
 ### Important CLI Flags
 
 - `--mode {single,consensus}`
@@ -196,7 +203,7 @@ uv run python main.py
 - `--agreement-iou-threshold`
   - used in `consensus` mode, defaults to `0.8`
 - `--common-geometry-mode {posthoc,two_stage,joint}`
-  - used in `consensus` mode, defaults to `posthoc`
+  - compatibility flag in `consensus` mode; the code now always normalizes this to `joint`
 - `--geometry-source-weight`
   - weight of source-consistency agreement in optimized common-fragment geometry selection, defaults to `1.0`
 - `--geometry-temporal-overlap-weight`
@@ -376,17 +383,6 @@ uv run python main.py \
   --consensus-sources embedseg stardist
 ```
 
-### Example: Merge With Two-Stage Common Geometry Optimization
-
-```bash
-uv run python main.py \
-  --mode consensus \
-  --dataset-root ./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa \
-  --extra-seg-root ./data/Fluo-N2DL-HeLa_train/Segmentations \
-  --consensus-sources embedseg stardist \
-  --common-geometry-mode two_stage
-```
-
 ### Example: Merge With Joint Lineage And Geometry Optimization
 
 ```bash
@@ -394,8 +390,7 @@ uv run python main.py \
   --mode consensus \
   --dataset-root ./data/Fluo-N2DL-HeLa_train/Fluo-N2DL-HeLa \
   --extra-seg-root ./data/Fluo-N2DL-HeLa_train/Segmentations \
-  --consensus-sources embedseg stardist \
-  --common-geometry-mode joint
+  --consensus-sources embedseg stardist
 ```
 
 ### What Consensus Mode Uses
@@ -420,43 +415,14 @@ as source solutions for the merge.
 6. Build common tracklets from shared trajectory fragments.
 7. Treat these common-supported tracklets as shared lineage candidates.
 8. Convert the remaining fragments from both solutions into hypothesis tracklets.
-9. Solve one global tracklet-level ILP over the whole sequence.
-10. If `--common-geometry-mode posthoc`, export four deterministic mask variants from the same lineage solution.
-11. If `--common-geometry-mode two_stage`, solve a second ILP that chooses one geometry option for each selected common-supported fragment.
-12. If `--common-geometry-mode joint`, solve one enlarged ILP that chooses lineage structure and common-fragment geometry together.
+9. Solve one enlarged ILP that chooses lineage structure and common-fragment geometry together.
+10. Export the optimized result as `optimized_joint/`.
 
 ### Consensus Output Variants
 
 For source-specific selected fragments, the geometry always comes from the source that generated that fragment.
 
-For selected common-supported fragments, the geometry depends on `--common-geometry-mode`.
-
-If `--common-geometry-mode posthoc`, the final masks can be rendered in four deterministic ways:
-
-- `intersection`
-  - pixelwise intersection of the two source masks
-- `union`
-  - pixelwise union of the two source masks
-- `embedseg`
-  - always use the `embedseg` geometry for the fixed common parts
-- `stardist`
-  - always use the `stardist` geometry for the fixed common parts
-
-All four consensus variants have:
-
-- the same selected lineage solution
-- the same `res_track.txt`
-- different `maskNNN.tif` files
-
-If `--common-geometry-mode two_stage`, PyTr2d exports:
-
-- `optimized_two_stage/`
-
-If `--common-geometry-mode joint`, PyTr2d exports:
-
-- `optimized_joint/`
-
-In both optimized modes, each selected common-supported fragment chooses one of:
+For selected common-supported fragments, the joint ILP chooses one of:
 
 - `embedseg`
 - `stardist`
@@ -515,23 +481,8 @@ Contains:
 - `variant_comparison.json`
 - `variant_comparison.txt`
 - `render_manifest.json`
-- variant folders, depending on `--common-geometry-mode`
-- optionally `geometry_assignments.json` for `two_stage` and `joint`
-
-With `--common-geometry-mode posthoc`, the variant folders are:
-
-- `intersection/`
-- `union/`
-- `embedseg/`
-- `stardist/`
-
-With `--common-geometry-mode two_stage`, the variant folder is:
-
-- `optimized_two_stage/`
-
-With `--common-geometry-mode joint`, the variant folder is:
-
 - `optimized_joint/`
+- `geometry_assignments.json`
 
 Each variant folder contains:
 

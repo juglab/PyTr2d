@@ -47,8 +47,13 @@ ORACLE_IOU_THRESHOLD = 0.5
 COMMON_FRAGMENT_BONUS_SCALE = 18.0
 SOURCE_FRAGMENT_BONUS_SCALE = 10.0
 BOUNDARY_PENALTY_SCALE = 1.25
-HANDOFF_OVERLAP_ABSOLUTE_PIXELS = 5
-HANDOFF_OVERLAP_RELATIVE_FRACTION = 0.05
+SHORT_INTERIOR_BORDER_DISTANCE_THRESHOLD = 5.0
+PERSISTENCE_TARGET_FRAMES = 4
+SOURCE_FRAGMENT_CONTEXT_IOU_THRESHOLD = 0.1
+CROSS_SOURCE_CONFLICT_IOU_THRESHOLD = 0.1
+SIGNIFICANT_OVERLAP_SMALLER_FRACTION = 0.5
+RENDER_CLIP_MAX_REMOVAL_FRACTION = 0.1
+MAX_RENDER_REPAIR_ATTEMPTS = 4
 PROGRESS_LOG_STEPS = 20
 PROGRESS_LOG_FALLBACK_EVERY = 250
 RENDER_MANIFEST_FILENAME = "render_manifest.json"
@@ -56,8 +61,11 @@ GEOMETRY_ASSIGNMENTS_FILENAME = "geometry_assignments.json"
 POSTHOC_GEOMETRY_MODE = "posthoc"
 TWO_STAGE_GEOMETRY_MODE = "two_stage"
 JOINT_GEOMETRY_MODE = "joint"
+SUPPORTED_COMMON_GEOMETRY_MODES = frozenset((POSTHOC_GEOMETRY_MODE, TWO_STAGE_GEOMETRY_MODE, JOINT_GEOMETRY_MODE))
 OPTIMIZED_TWO_STAGE_VARIANT = "optimized_two_stage"
 OPTIMIZED_JOINT_VARIANT = "optimized_joint"
+MOVE_SOURCE_LINEAGE_SUPPORT_REWARD = 1.0
+DIVISION_SOURCE_LINEAGE_SUPPORT_REWARD = 1.25
 
 
 @dataclass(slots=True)
@@ -211,17 +219,10 @@ class TrackletNode:
 class ContinuationCandidate:
     parent_id: int
     child_id: int
-    shared_boundary_frame: int | None
-    overlap_pixels: int
-    overlap_fraction: float
 
     @property
     def pair_key(self) -> frozenset[int]:
         return frozenset((self.parent_id, self.child_id))
-
-    @property
-    def is_tolerated_handoff(self) -> bool:
-        return self.shared_boundary_frame is not None
 
 
 @dataclass(slots=True, frozen=True)
@@ -263,6 +264,34 @@ class GeometryOptimizationResult:
     diagnostics: dict[str, object]
 
 
+@dataclass(slots=True, frozen=True)
+class RenderConflictResolution:
+    resolved_coords: np.ndarray
+    available_mask: np.ndarray
+    clipped_pixels: int
+    clipped_fraction: float
+    action: str
+    failure_reason: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RenderConflictDiagnostic:
+    frame_index: int
+    node_id: int
+    conflicting_node_id: int
+    track_id: int
+    conflicting_track_id: int
+    overlap_pixels: int
+    fragment_pixels: int
+    remaining_pixels: int
+    clipped_fraction: float
+    failure_reason: str
+
+    @property
+    def pair_key(self) -> frozenset[int]:
+        return frozenset((self.node_id, self.conflicting_node_id))
+
+
 @dataclass(slots=True)
 class GeometryQueryCache:
     coords_by_key: dict[tuple[int, str, int], np.ndarray] = field(default_factory=dict)
@@ -272,6 +301,15 @@ class GeometryQueryCache:
 
 def default_consensus_variant_names(source_names: tuple[str, str]) -> tuple[str, ...]:
     return ("intersection", "union", source_names[0], source_names[1])
+
+
+def effective_common_geometry_mode(common_geometry_mode: str) -> str:
+    if common_geometry_mode not in SUPPORTED_COMMON_GEOMETRY_MODES:
+        raise ValueError(
+            f"Unsupported common geometry mode '{common_geometry_mode}'. "
+            f"Expected one of {tuple(sorted(SUPPORTED_COMMON_GEOMETRY_MODES))}."
+        )
+    return JOINT_GEOMETRY_MODE
 
 
 def geometry_option_names(source_names: tuple[str, str]) -> tuple[str, ...]:
@@ -286,6 +324,15 @@ def optimized_variant_name(common_geometry_mode: str) -> str:
     raise ValueError(f"Optimized geometry mode expected, found '{common_geometry_mode}'.")
 
 
+def primary_variant_name(variant_names: tuple[str, ...]) -> str | None:
+    for preferred_name in (OPTIMIZED_JOINT_VARIANT, OPTIMIZED_TWO_STAGE_VARIANT):
+        if preferred_name in variant_names:
+            return preferred_name
+    if not variant_names:
+        return None
+    return variant_names[0]
+
+
 def render_manifest_path(output_root: Path) -> Path:
     return output_root / RENDER_MANIFEST_FILENAME
 
@@ -294,13 +341,25 @@ def geometry_assignments_path(output_root: Path) -> Path:
     return output_root / GEOMETRY_ASSIGNMENTS_FILENAME
 
 
+def normalize_conflict_pairs(
+    conflicts: tuple[frozenset[int], ...] | set[frozenset[int]] | list[frozenset[int]] | tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int], ...]:
+    normalized: set[tuple[int, int]] = set()
+    for pair in conflicts:
+        pair_values = tuple(sorted(int(node_id) for node_id in pair))
+        if len(pair_values) != 2:
+            raise ValueError(f"Conflict pair must contain exactly two node ids, found {pair_values}.")
+        normalized.add(pair_values)
+    return tuple(sorted(normalized))
+
+
 def build_render_manifest(
     config: TrackingConfig,
     variant_names: tuple[str, ...],
     geometry_assignments_filename: str | None = None,
 ) -> dict[str, object]:
     return {
-        "common_geometry_mode": config.common_geometry_mode,
+        "common_geometry_mode": effective_common_geometry_mode(config.common_geometry_mode),
         "variant_names": list(variant_names),
         "consensus_sources": list(config.consensus_sources),
         "geometry_source_weight": float(config.geometry_source_weight),
@@ -333,13 +392,17 @@ def load_render_manifest(output_root: Path) -> dict[str, object] | None:
 def render_variant_names_from_manifest(
     manifest: dict[str, object] | None,
     source_names: tuple[str, str],
+    common_geometry_mode: str,
 ) -> tuple[str, ...]:
     if manifest is None:
-        return default_consensus_variant_names(source_names)
+        return (optimized_variant_name(effective_common_geometry_mode(common_geometry_mode)),)
     variant_names = manifest.get("variant_names")
     if isinstance(variant_names, list) and all(isinstance(value, str) for value in variant_names):
         return tuple(str(value) for value in variant_names)
-    return default_consensus_variant_names(source_names)
+    manifest_mode = manifest.get("common_geometry_mode")
+    if isinstance(manifest_mode, str):
+        return (optimized_variant_name(effective_common_geometry_mode(manifest_mode)),)
+    return (optimized_variant_name(effective_common_geometry_mode(common_geometry_mode)),)
 
 
 def saved_geometry_assignments_path(
@@ -395,6 +458,368 @@ def geometry_source_agreement(
     return float(len(left_support & right_support) / len(union))
 
 
+def format_render_conflict_failure_reason(
+    failure_reason: str,
+    *,
+    clipped_fraction: float,
+) -> str:
+    if failure_reason == "clip_fraction_exceeded":
+        return f"clipping {100.0 * clipped_fraction:.1f}% exceeds the {100.0 * RENDER_CLIP_MAX_REMOVAL_FRACTION:.1f}% limit"
+    if failure_reason == "disconnected_remainder":
+        return "clipping would disconnect the remaining fragment"
+    if failure_reason == "fully_occupied":
+        return "all overlapping pixels are already occupied by other selected tracks"
+    return "the overlap cannot be resolved safely"
+
+
+def describe_tracklet_node(node: TrackletNode) -> str:
+    if node.is_common_supported:
+        source_names = node.source_names if node.source_names is not None else ()
+        source_track_ids = node.source_track_ids if node.source_track_ids is not None else ()
+        return f"{node.kind}:{'+'.join(source_names)}:{source_track_ids}"
+    return f"{node.kind}:{node.source_name}:{node.source_track_id}"
+
+
+def format_render_conflict_diagnostics(
+    diagnostics: tuple[RenderConflictDiagnostic, ...],
+    nodes: tuple[TrackletNode, ...],
+) -> str:
+    node_lookup = {node.node_id: node for node in nodes}
+    parts: list[str] = []
+    for diagnostic in diagnostics:
+        current_node = node_lookup.get(diagnostic.node_id)
+        conflicting_node = node_lookup.get(diagnostic.conflicting_node_id)
+        current_desc = describe_tracklet_node(current_node) if current_node is not None else f"node {diagnostic.node_id}"
+        conflicting_desc = (
+            describe_tracklet_node(conflicting_node)
+            if conflicting_node is not None
+            else f"node {diagnostic.conflicting_node_id}"
+        )
+        parts.append(
+            f"frame {diagnostic.frame_index}: fragment {diagnostic.node_id} ({current_desc}) "
+            f"track {diagnostic.track_id} overlaps fragment {diagnostic.conflicting_node_id} "
+            f"({conflicting_desc}) track {diagnostic.conflicting_track_id} by "
+            f"{diagnostic.overlap_pixels} pixel(s); "
+            f"{format_render_conflict_failure_reason(diagnostic.failure_reason, clipped_fraction=diagnostic.clipped_fraction)}"
+        )
+    return "; ".join(parts)
+
+
+def selected_nodes_in_render_order(
+    nodes: tuple[TrackletNode, ...],
+    selected_nodes: set[int],
+    node_to_final_track: dict[int, int],
+) -> tuple[TrackletNode, ...]:
+    selected_node_list = [node for node in nodes if node.node_id in selected_nodes]
+    selected_node_list.sort(
+        key=lambda item: (
+            node_to_final_track[item.node_id],
+            item.begin,
+            0 if item.is_common_supported else 1,
+            item.node_id,
+        )
+    )
+    return tuple(selected_node_list)
+
+
+def node_render_coords(
+    variant_name: str,
+    node: TrackletNode,
+    frame_index: int,
+    indexed_solutions: dict[str, SolutionIndex],
+    common_geometry_assignments: dict[int, str] | None = None,
+) -> np.ndarray:
+    if common_geometry_assignments is not None and node.is_common_supported:
+        assigned_option = common_geometry_assignments.get(node.node_id)
+        if assigned_option is None:
+            raise ValueError(f"Missing geometry assignment for selected common-supported fragment {node.node_id}.")
+        return node_coords_for_option(node, assigned_option, frame_index, indexed_solutions)
+    return node_variant_coords(variant_name, node, frame_index, indexed_solutions)
+
+
+def build_node_total_area(
+    nodes: tuple[TrackletNode, ...],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> dict[int, int]:
+    total_area_by_node: dict[int, int] = {}
+    for node in nodes:
+        if node.source_name is None or node.source_track_id is None:
+            continue
+        solution_index = indexed_solutions.get(node.source_name)
+        if solution_index is None:
+            continue
+        total_area = 0
+        for frame_index in range(node.begin, node.end + 1):
+            frame = solution_index.solution.frames[frame_index]
+            object_index = frame.raw_label_to_index.get(node.source_track_id)
+            if object_index is None:
+                continue
+            total_area += int(frame.areas[object_index])
+        total_area_by_node[node.node_id] = total_area
+    return total_area_by_node
+
+
+def resolve_overlap_to_smaller(
+    *,
+    variant_name: str,
+    node: TrackletNode,
+    frame_index: int,
+    coords: np.ndarray,
+    resolution: RenderConflictResolution,
+    frame_mask: np.ndarray,
+    frame_owner_mask: np.ndarray | None,
+    nodes_by_id: dict[int, TrackletNode] | None,
+    node_total_area: dict[int, int] | None,
+    log_action: bool,
+) -> np.ndarray | None:
+    if resolution.action != "failure":
+        return None
+    if frame_owner_mask is None or nodes_by_id is None or node_total_area is None:
+        return None
+    current_area = node_total_area.get(node.node_id)
+    if node.source_name is None or current_area is None:
+        return None
+    unavailable_coords = np.asarray(coords[~resolution.available_mask], dtype=np.int32)
+    if unavailable_coords.size == 0:
+        return None
+    overlap_pixels = int(unavailable_coords.shape[0])
+    owner_ids_raw = frame_owner_mask[unavailable_coords[:, 0], unavailable_coords[:, 1]]
+    owner_ids = np.asarray(owner_ids_raw, dtype=np.int32) - 1
+    can_resolve = True
+    current_wins = np.zeros(len(unavailable_coords), dtype=bool)
+    owners_losing: dict[int, list[int]] = {}
+    for idx, owner_id in enumerate(owner_ids):
+        if owner_id < 0:
+            can_resolve = False
+            break
+        owner_node = nodes_by_id.get(int(owner_id))
+        if owner_node is None or owner_node.source_name is None:
+            can_resolve = False
+            break
+        if owner_node.source_name == node.source_name:
+            can_resolve = False
+            break
+        owner_area = node_total_area.get(int(owner_id))
+        if owner_area is None:
+            can_resolve = False
+            break
+        if current_area < owner_area:
+            current_wins[idx] = True
+            owners_losing.setdefault(int(owner_id), []).append(idx)
+    if not can_resolve:
+        return None
+    if owners_losing:
+        for owner_id, loss_indices in owners_losing.items():
+            owner_mask = frame_owner_mask == (owner_id + 1)
+            if not np.any(owner_mask):
+                return None
+            loss_coords = unavailable_coords[np.asarray(loss_indices, dtype=np.int32)]
+            owner_mask[loss_coords[:, 0], loss_coords[:, 1]] = False
+            remaining_coords = np.argwhere(owner_mask)
+            if remaining_coords.size == 0:
+                return None
+            if not clipped_coords_form_single_component(remaining_coords, frame_mask.shape):
+                return None
+    resolved_coords = np.asarray(
+        np.concatenate([coords[resolution.available_mask], unavailable_coords[current_wins]], axis=0),
+        dtype=np.int32,
+    )
+    if resolved_coords.size == 0:
+        return None
+    if not clipped_coords_form_single_component(resolved_coords, frame_mask.shape):
+        return None
+    if log_action:
+        reassigned_pixels = int(np.count_nonzero(current_wins))
+        if reassigned_pixels > 0:
+            LOGGER.warning(
+                "Variant '%s' reassigned %s pixel(s) at frame %03d to smaller fragment %s (area %s) over larger overlaps.",
+                variant_name,
+                reassigned_pixels,
+                frame_index,
+                node.node_id,
+                current_area,
+            )
+        else:
+            LOGGER.warning(
+                "Variant '%s' allowed fragment %s to drop %s overlapping pixel(s) at frame %03d to preserve smaller cells.",
+                variant_name,
+                node.node_id,
+                overlap_pixels,
+                frame_index,
+            )
+    return resolved_coords
+
+
+def analyze_render_conflicts(
+    variant_name: str,
+    node: TrackletNode,
+    track_id: int,
+    frame_index: int,
+    coords: np.ndarray,
+    frame_mask: np.ndarray,
+    indexed_solutions: dict[str, SolutionIndex],
+) -> RenderConflictResolution:
+    existing_labels = frame_mask[coords[:, 0], coords[:, 1]]
+    available = (existing_labels == 0) | (existing_labels == track_id)
+    if np.all(available):
+        return RenderConflictResolution(
+            resolved_coords=np.asarray(coords, dtype=np.int32),
+            available_mask=np.asarray(available, dtype=bool),
+            clipped_pixels=0,
+            clipped_fraction=0.0,
+            action="all_available",
+        )
+
+    clipped_coords = np.asarray(coords[available], dtype=np.int32)
+    clipped_pixels = int(np.count_nonzero(~available))
+    clipped_fraction = float(clipped_pixels / max(1, len(coords)))
+
+    if variant_name == "union" and node.is_common_supported:
+        if clipped_coords.size > 0:
+            return RenderConflictResolution(
+                resolved_coords=clipped_coords,
+                available_mask=np.asarray(available, dtype=bool),
+                clipped_pixels=clipped_pixels,
+                clipped_fraction=clipped_fraction,
+                action="union_clip",
+            )
+
+        fallback_coords = node_variant_coords("intersection", node, frame_index, indexed_solutions)
+        if fallback_coords.size > 0:
+            fallback_existing = frame_mask[fallback_coords[:, 0], fallback_coords[:, 1]]
+            fallback_available = (fallback_existing == 0) | (fallback_existing == track_id)
+            fallback_coords = np.asarray(fallback_coords[fallback_available], dtype=np.int32)
+            if fallback_coords.size > 0:
+                return RenderConflictResolution(
+                    resolved_coords=fallback_coords,
+                    available_mask=np.asarray(available, dtype=bool),
+                    clipped_pixels=clipped_pixels,
+                    clipped_fraction=clipped_fraction,
+                    action="union_intersection_fallback",
+                )
+
+    if (
+        clipped_coords.size > 0
+        and clipped_fraction <= RENDER_CLIP_MAX_REMOVAL_FRACTION
+        and clipped_coords_form_single_component(clipped_coords, frame_mask.shape)
+    ):
+        return RenderConflictResolution(
+            resolved_coords=clipped_coords,
+            available_mask=np.asarray(available, dtype=bool),
+            clipped_pixels=clipped_pixels,
+            clipped_fraction=clipped_fraction,
+            action="small_clip",
+        )
+
+    if clipped_coords.size == 0:
+        failure_reason = "fully_occupied"
+    elif clipped_fraction > RENDER_CLIP_MAX_REMOVAL_FRACTION:
+        failure_reason = "clip_fraction_exceeded"
+    else:
+        failure_reason = "disconnected_remainder"
+    return RenderConflictResolution(
+        resolved_coords=clipped_coords,
+        available_mask=np.asarray(available, dtype=bool),
+        clipped_pixels=clipped_pixels,
+        clipped_fraction=clipped_fraction,
+        action="failure",
+        failure_reason=failure_reason,
+    )
+
+
+def find_unrenderable_render_conflicts(
+    variant_name: str,
+    raw_frames: np.ndarray,
+    nodes: tuple[TrackletNode, ...],
+    selected_nodes: set[int],
+    node_to_final_track: dict[int, int],
+    indexed_solutions: dict[str, SolutionIndex],
+    common_geometry_assignments: dict[int, str] | None = None,
+) -> tuple[RenderConflictDiagnostic, ...]:
+    tracked_masks = np.zeros((len(raw_frames), *raw_frames[0].shape), dtype=np.uint16)
+    owner_masks = np.zeros((len(raw_frames), *raw_frames[0].shape), dtype=np.int32)
+    nodes_by_id = {node.node_id: node for node in nodes}
+    node_total_area = build_node_total_area(nodes, indexed_solutions)
+
+    for node in selected_nodes_in_render_order(nodes, selected_nodes, node_to_final_track):
+        track_id = node_to_final_track[node.node_id]
+        for frame_index in range(node.begin, node.end + 1):
+            coords = node_render_coords(
+                variant_name=variant_name,
+                node=node,
+                frame_index=frame_index,
+                indexed_solutions=indexed_solutions,
+                common_geometry_assignments=common_geometry_assignments,
+            )
+            if coords.size == 0:
+                continue
+            frame_mask = tracked_masks[frame_index]
+            resolution = analyze_render_conflicts(
+                variant_name=variant_name,
+                node=node,
+                track_id=track_id,
+                frame_index=frame_index,
+                coords=coords,
+                frame_mask=frame_mask,
+                indexed_solutions=indexed_solutions,
+            )
+            if resolution.action == "failure":
+                reassigned_coords = resolve_overlap_to_smaller(
+                    variant_name=variant_name,
+                    node=node,
+                    frame_index=frame_index,
+                    coords=coords,
+                    resolution=resolution,
+                    frame_mask=frame_mask,
+                    frame_owner_mask=owner_masks[frame_index],
+                    nodes_by_id=nodes_by_id,
+                    node_total_area=node_total_area,
+                    log_action=False,
+                )
+                if reassigned_coords is not None and reassigned_coords.size > 0:
+                    frame_mask[reassigned_coords[:, 0], reassigned_coords[:, 1]] = np.uint16(track_id)
+                    owner_masks[frame_index][reassigned_coords[:, 0], reassigned_coords[:, 1]] = np.int32(
+                        node.node_id + 1
+                    )
+                    continue
+                unavailable_coords = np.asarray(coords[~resolution.available_mask], dtype=np.int32)
+                frame_owner_mask = owner_masks[frame_index]
+                overlap_owner_ids, overlap_counts = np.unique(
+                    frame_owner_mask[unavailable_coords[:, 0], unavailable_coords[:, 1]],
+                    return_counts=True,
+                )
+                diagnostics: list[RenderConflictDiagnostic] = []
+                for owner_id_raw, overlap_pixels_raw in zip(overlap_owner_ids, overlap_counts, strict=True):
+                    if int(owner_id_raw) <= 0:
+                        continue
+                    conflicting_node_id = int(owner_id_raw) - 1
+                    diagnostics.append(
+                        RenderConflictDiagnostic(
+                            frame_index=frame_index,
+                            node_id=node.node_id,
+                            conflicting_node_id=conflicting_node_id,
+                            track_id=track_id,
+                            conflicting_track_id=node_to_final_track[conflicting_node_id],
+                            overlap_pixels=int(overlap_pixels_raw),
+                            fragment_pixels=int(len(coords)),
+                            remaining_pixels=int(len(resolution.resolved_coords)),
+                            clipped_fraction=resolution.clipped_fraction,
+                            failure_reason=resolution.failure_reason or "unknown",
+                        )
+                    )
+                return tuple(
+                    sorted(
+                        diagnostics,
+                        key=lambda item: (item.frame_index, item.node_id, item.conflicting_node_id),
+                    )
+                )
+            if resolution.resolved_coords.size == 0:
+                continue
+            frame_mask[resolution.resolved_coords[:, 0], resolution.resolved_coords[:, 1]] = np.uint16(track_id)
+            owner_masks[frame_index][resolution.resolved_coords[:, 0], resolution.resolved_coords[:, 1]] = np.int32(node.node_id + 1)
+    return ()
+
+
 def solve_consensus_tracking(
     config: TrackingConfig,
     raw_frames: np.ndarray,
@@ -411,6 +836,7 @@ def solve_consensus_tracking(
         )
 
     LOGGER.info("Preparing consensus tracking from sources: %s.", ", ".join(source_names))
+    common_geometry_mode = effective_common_geometry_mode(config.common_geometry_mode)
     indexed_solutions = {name: build_solution_index(solution) for name, solution in solutions_by_source.items()}
     preparation = prepare_consensus(config, indexed_solutions, scorers)
     output_root = projectio.resolve_consensus_output_dir(config)
@@ -436,12 +862,29 @@ def solve_consensus_tracking(
     LOGGER.info("Wrote pre-merge metrics to %s and %s.", premerge_json_path, premerge_text_path)
 
     geometry_result: GeometryOptimizationResult | None = None
-    if config.common_geometry_mode == JOINT_GEOMETRY_MODE:
+    selected_nodes: set[int] = set()
+    incoming_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None] = {}
+    outgoing_choice: dict[int, tuple[str, int] | tuple[str, int, int] | None] = {}
+    joint_selected_graph_stats: dict[str, object] = {}
+    lineage_rows: tuple[LineageRecord, ...] = ()
+    node_to_final_track: dict[int, int] = {}
+    extra_hard_conflicts: set[frozenset[int]] = set()
+    render_conflicts: tuple[RenderConflictDiagnostic, ...] = ()
+    optimized_variant = optimized_variant_name(common_geometry_mode)
+
+    for attempt_index in range(1, MAX_RENDER_REPAIR_ATTEMPTS + 1):
+        if extra_hard_conflicts:
+            LOGGER.info(
+                "Consensus render repair attempt %s/%s with %s extra hard conflict(s).",
+                attempt_index,
+                MAX_RENDER_REPAIR_ATTEMPTS,
+                len(extra_hard_conflicts),
+            )
         (
             selected_nodes,
             incoming_choice,
             outgoing_choice,
-            selected_graph_stats,
+            joint_selected_graph_stats,
             common_geometry_assignments,
             geometry_diagnostics,
         ) = solve_joint_tracklet_geometry_ilp(
@@ -449,84 +892,100 @@ def solve_consensus_tracking(
             preparation=preparation,
             indexed_solutions=indexed_solutions,
             scorers=scorers,
+            extra_hard_conflicts=tuple(sorted(extra_hard_conflicts, key=lambda pair: tuple(sorted(pair)))),
         )
         geometry_result = GeometryOptimizationResult(
-            variant_name=optimized_variant_name(config.common_geometry_mode),
+            variant_name=optimized_variant,
             common_geometry_assignments=common_geometry_assignments,
             diagnostics=geometry_diagnostics,
         )
-    else:
-        solver_result = solve_global_tracklet_ilp(
-            config=config,
-            preparation=preparation,
-            indexed_solutions=indexed_solutions,
-            scorers=scorers,
-        )
-        if len(solver_result) == 3:
-            selected_nodes, incoming_choice, outgoing_choice = solver_result
-            selected_graph_stats = {}
-        else:
-            selected_nodes, incoming_choice, outgoing_choice, selected_graph_stats = solver_result
-    lineage_rows, node_to_final_track = decode_selected_tracklets(
-        nodes=preparation.nodes,
-        selected_nodes=selected_nodes,
-        incoming_choice=incoming_choice,
-        outgoing_choice=outgoing_choice,
-    )
-
-    if config.common_geometry_mode == TWO_STAGE_GEOMETRY_MODE:
-        geometry_result = solve_two_stage_geometry_ilp(
-            config=config,
-            preparation=preparation,
-            indexed_solutions=indexed_solutions,
+        lineage_rows, node_to_final_track = decode_selected_tracklets(
+            nodes=preparation.nodes,
             selected_nodes=selected_nodes,
             incoming_choice=incoming_choice,
             outgoing_choice=outgoing_choice,
         )
-
-    tracked_masks_by_variant: dict[str, np.ndarray]
-    optimized_geometry_payloads: dict[str, dict[str, object]] = {}
-    geometry_assignments_json_path: Path | None = None
-    if geometry_result is None:
-        tracked_masks_by_variant = {
-            variant_name: render_variant_masks(
-                variant_name=variant_name,
-                raw_frames=raw_frames,
-                nodes=preparation.nodes,
-                selected_nodes=selected_nodes,
-                node_to_final_track=node_to_final_track,
-                indexed_solutions=indexed_solutions,
-            )
-            for variant_name in default_consensus_variant_names(source_names)
-        }
-    else:
-        tracked_masks_by_variant = {
-            geometry_result.variant_name: render_variant_masks(
-                variant_name=geometry_result.variant_name,
-                raw_frames=raw_frames,
-                nodes=preparation.nodes,
-                selected_nodes=selected_nodes,
-                node_to_final_track=node_to_final_track,
-                indexed_solutions=indexed_solutions,
-                common_geometry_assignments=geometry_result.common_geometry_assignments,
-            )
-        }
-        optimized_geometry_payloads[geometry_result.variant_name] = geometry_result.diagnostics
-        geometry_assignments_json_path = geometry_assignments_path(output_root)
-        reporting.write_json(
-            geometry_assignments_json_path,
-            {
-                "common_geometry_mode": config.common_geometry_mode,
-                "assignments": {
-                    str(node_id): option_name
-                    for node_id, option_name in sorted(geometry_result.common_geometry_assignments.items())
-                },
-                "diagnostics": geometry_result.diagnostics,
-            },
+        render_conflicts = find_unrenderable_render_conflicts(
+            variant_name=optimized_variant,
+            raw_frames=raw_frames,
+            nodes=preparation.nodes,
+            selected_nodes=selected_nodes,
+            node_to_final_track=node_to_final_track,
+            indexed_solutions=indexed_solutions,
+            common_geometry_assignments=geometry_result.common_geometry_assignments,
         )
-        LOGGER.info("Wrote geometry assignments to %s.", geometry_assignments_json_path)
+        if not render_conflicts:
+            break
+        LOGGER.warning(
+            "Consensus render validation found %s unrenderable overlap pair(s) after solve attempt %s/%s: %s",
+            len(render_conflicts),
+            attempt_index,
+            MAX_RENDER_REPAIR_ATTEMPTS,
+            format_render_conflict_diagnostics(render_conflicts, preparation.nodes),
+        )
+        new_conflicts = {diagnostic.pair_key for diagnostic in render_conflicts} - extra_hard_conflicts
+        if attempt_index >= MAX_RENDER_REPAIR_ATTEMPTS or not new_conflicts:
+            LOGGER.error(
+                "Optimized consensus outputs were not regenerated because '%s' remained unrenderable after %s attempt(s).",
+                optimized_variant,
+                attempt_index,
+            )
+            raise ValueError(
+                f"Consensus variant '{optimized_variant}' remained unrenderable after {attempt_index} attempt(s): "
+                f"{format_render_conflict_diagnostics(render_conflicts, preparation.nodes)}"
+            )
+        LOGGER.warning(
+            "Adding %s extra hard conflict pair(s) and re-solving the joint consensus ILP.",
+            len(new_conflicts),
+        )
+        extra_hard_conflicts.update(new_conflicts)
 
+    if geometry_result is None:
+        raise RuntimeError("Consensus joint optimization did not produce a geometry result.")
+
+    tracked_masks_by_variant: dict[str, np.ndarray] = {}
+    variant_lineage_rows: dict[str, tuple[LineageRecord, ...]] = {}
+    optimized_geometry_payloads: dict[str, dict[str, object]] = {}
+    geometry_assignments_payloads: dict[str, dict[str, object]] = {}
+    geometry_assignments_json_path: Path | None = None
+    joint_geometry_payload = dict(geometry_result.diagnostics)
+    joint_geometry_payload["common_geometry_mode"] = common_geometry_mode
+    joint_geometry_payload["selected_graph_statistics"] = dict(joint_selected_graph_stats)
+    tracked_masks_by_variant[geometry_result.variant_name] = render_variant_masks(
+        variant_name=geometry_result.variant_name,
+        raw_frames=raw_frames,
+        nodes=preparation.nodes,
+        selected_nodes=selected_nodes,
+        node_to_final_track=node_to_final_track,
+        indexed_solutions=indexed_solutions,
+        common_geometry_assignments=geometry_result.common_geometry_assignments,
+    )
+    variant_lineage_rows[geometry_result.variant_name] = lineage_rows
+    optimized_geometry_payloads[geometry_result.variant_name] = joint_geometry_payload
+    geometry_assignments_payloads[geometry_result.variant_name] = {
+        "common_geometry_mode": common_geometry_mode,
+        "assignments": {
+            str(node_id): option_name
+            for node_id, option_name in sorted(geometry_result.common_geometry_assignments.items())
+        },
+        "diagnostics": joint_geometry_payload,
+    }
+
+    geometry_assignments_json_path = geometry_assignments_path(output_root)
     variant_names = tuple(tracked_masks_by_variant)
+    primary_variant = primary_variant_name(variant_names)
+    geometry_assignments_payload = {
+        "primary_variant": primary_variant,
+        "variants": geometry_assignments_payloads,
+    }
+    if primary_variant is not None and primary_variant in geometry_assignments_payloads:
+        geometry_assignments_payload.update(geometry_assignments_payloads[primary_variant])
+    reporting.write_json(
+        geometry_assignments_json_path,
+        geometry_assignments_payload,
+    )
+    LOGGER.info("Wrote geometry assignments to %s.", geometry_assignments_json_path)
+
     render_manifest = build_render_manifest(
         config=config,
         variant_names=variant_names,
@@ -541,14 +1000,14 @@ def solve_consensus_tracking(
         preparation=preparation,
         output_root=output_root,
         source_names=source_names,
-        lineage_rows=lineage_rows,
         tracked_masks_by_variant=tracked_masks_by_variant,
+        variant_lineage_rows=variant_lineage_rows,
         premerge_json_path=premerge_json_path,
         premerge_text_path=premerge_text_path,
         diagnostics=FragmentDiagnostics(
             best_input_source=None,
             best_input_tra=None,
-            graph_statistics={**preparation.graph_stats, **selected_graph_stats},
+            graph_statistics=preparation.graph_stats,
             oracle_metrics=preparation.oracle_metrics,
             variant_deltas_to_best_input={},
         ),
@@ -568,13 +1027,14 @@ def evaluate_saved_consensus_outputs(
         raise ValueError("Consensus evaluation currently expects exactly two saved source solutions.")
 
     source_names = tuple(config.consensus_sources)
+    common_geometry_mode = effective_common_geometry_mode(config.common_geometry_mode)
     indexed_solutions = {name: build_solution_index(solution) for name, solution in solutions_by_source.items()}
     LOGGER.info("Recomputing consensus pre-merge metrics from saved source solutions.")
     preparation = prepare_consensus(config, indexed_solutions, scorers=None)
     output_root = projectio.resolve_consensus_output_dir(config)
     output_root.mkdir(parents=True, exist_ok=True)
     manifest = load_render_manifest(output_root)
-    variant_names = render_variant_names_from_manifest(manifest, source_names)
+    variant_names = render_variant_names_from_manifest(manifest, source_names, common_geometry_mode)
 
     premerge_json_path = output_root / "premerge_metrics.json"
     premerge_text_path = output_root / "premerge_metrics.txt"
@@ -591,17 +1051,14 @@ def evaluate_saved_consensus_outputs(
     LOGGER.info("Wrote pre-merge metrics to %s and %s.", premerge_json_path, premerge_text_path)
 
     tracked_masks_by_variant: dict[str, np.ndarray] = {}
-    lineage_rows: tuple[LineageRecord, ...] | None = None
+    variant_lineage_rows: dict[str, tuple[LineageRecord, ...]] = {}
     for variant_name in variant_names:
         variant_dir = output_root / variant_name
         saved_variant = projectio.load_saved_tracking_solution(variant_name, variant_dir, raw_frames)
         tracked_masks_by_variant[variant_name] = saved_variant.tracked_masks
-        if lineage_rows is None:
-            lineage_rows = saved_variant.lineage_rows
-        elif lineage_rows != saved_variant.lineage_rows:
-            raise ValueError(f"Saved consensus variant '{variant_name}' has lineage rows inconsistent with the other variants.")
+        variant_lineage_rows[variant_name] = saved_variant.lineage_rows
 
-    if lineage_rows is None:
+    if not variant_lineage_rows:
         raise ValueError(f"No saved consensus variants were found under {output_root}.")
 
     geometry_assignments_json_path = saved_geometry_assignments_path(output_root, manifest)
@@ -620,8 +1077,8 @@ def evaluate_saved_consensus_outputs(
         preparation=preparation,
         output_root=output_root,
         source_names=source_names,
-        lineage_rows=lineage_rows,
         tracked_masks_by_variant=tracked_masks_by_variant,
+        variant_lineage_rows=variant_lineage_rows,
         premerge_json_path=premerge_json_path,
         premerge_text_path=premerge_text_path,
         diagnostics=FragmentDiagnostics(
@@ -645,8 +1102,8 @@ def _finalize_consensus_outputs(
     preparation: ConsensusPreparation,
     output_root: Path,
     source_names: tuple[str, str],
-    lineage_rows: tuple[LineageRecord, ...],
     tracked_masks_by_variant: dict[str, np.ndarray],
+    variant_lineage_rows: dict[str, tuple[LineageRecord, ...]],
     premerge_json_path: Path,
     premerge_text_path: Path,
     diagnostics: FragmentDiagnostics,
@@ -663,9 +1120,12 @@ def _finalize_consensus_outputs(
     selected_common_tracklets = 0
     best_input_source, best_input_tra = best_input_baseline(preparation.input_metrics.input_solution_metrics)
     variant_deltas: dict[str, dict[str, float]] = {}
+    variant_names = tuple(tracked_masks_by_variant)
+    primary_variant = primary_variant_name(variant_names)
 
     for variant_name, tracked_masks in tracked_masks_by_variant.items():
         variant_dir = output_root / variant_name
+        lineage_rows = variant_lineage_rows[variant_name]
         if write_outputs:
             mask_paths, lineage_path = projectio.write_tracking_outputs(variant_dir, tracked_masks, lineage_rows)
         else:
@@ -746,7 +1206,7 @@ def _finalize_consensus_outputs(
 
     return ConsensusResult(
         selected_sources=source_names,
-        lineage_rows=lineage_rows,
+        lineage_rows=variant_lineage_rows.get(primary_variant, ()),
         output_dir=output_root,
         premerge_metrics_path=premerge_json_path,
         premerge_metrics_text_path=premerge_text_path,
@@ -765,8 +1225,13 @@ def _load_gt_solution_index(
     raw_frames: np.ndarray,
 ) -> SolutionIndex | None:
     try:
-        gt_frames = projectio.load_gt_frame_objects(config.dataset_root, config.track_sequence, raw_frames)
-        gt_rows = tuple(projectio.load_lineage_records(config.dataset_root, config.track_sequence).values())
+        gt_frames, gt_records = projectio.load_gt_tracking_reference(
+            config.dataset_root,
+            config.track_sequence,
+            raw_frames,
+            ignore_disconnected_tracks=True,
+        )
+        gt_rows = tuple(gt_records.values())
         gt_solution = SavedTrackingSolution(
             source_name="gt",
             output_dir=config.dataset_root / f"{config.track_sequence}_GT" / "TRA",
@@ -811,9 +1276,24 @@ def prepare_consensus(
     LOGGER.info("Consensus prep 1/%s complete: matched %s object pair(s) across %s frame(s).", stage_total, matched_pairs, len(matches_by_frame))
 
     log_consensus_stage(2, stage_total, "Splitting source trajectories into atomic fragments.")
+    overlap_signatures = build_significant_overlap_signatures(
+        solution_1,
+        solution_2,
+        SOURCE_FRAGMENT_CONTEXT_IOU_THRESHOLD,
+    )
     source_fragments = {
-        source_name_1: build_source_fragments(solution_1, matches_by_frame, source_name_1),
-        source_name_2: build_source_fragments(solution_2, matches_by_frame, source_name_2),
+        source_name_1: build_source_fragments(
+            solution_1,
+            matches_by_frame,
+            source_name_1,
+            overlap_signatures[source_name_1],
+        ),
+        source_name_2: build_source_fragments(
+            solution_2,
+            matches_by_frame,
+            source_name_2,
+            overlap_signatures[source_name_2],
+        ),
     }
     LOGGER.info(
         "Consensus prep 2/%s complete: %s fragment(s) for %s and %s fragment(s) for %s.",
@@ -842,15 +1322,13 @@ def prepare_consensus(
     LOGGER.info("Consensus prep 6/%s complete: built %s continuation candidate(s).", stage_total, len(continuation_candidates))
 
     log_consensus_stage(7, stage_total, "Building spatial conflict pairs.")
-    tolerated_pair_keys = {candidate.pair_key for candidate in continuation_candidates if candidate.is_tolerated_handoff}
-    overlap_pairs = compute_overlap_pairs(nodes, frame_index, config.consensus_sources)
-    hard_conflicts = tuple(sorted((pair for pair in overlap_pairs if pair not in tolerated_pair_keys), key=lambda pair: tuple(sorted(pair))))
+    overlap_pairs = compute_overlap_pairs(nodes, frame_index, config.consensus_sources, indexed_solutions)
+    hard_conflicts = tuple(sorted(overlap_pairs, key=lambda pair: tuple(sorted(pair))))
     LOGGER.info(
-        "Consensus prep 7/%s complete: %s overlap pair(s), %s hard conflict(s), %s tolerated handoff pair(s).",
+        "Consensus prep 7/%s complete: %s overlap pair(s), %s hard conflict(s).",
         stage_total,
         len(overlap_pairs),
         len(hard_conflicts),
-        len(tolerated_pair_keys),
     )
 
     log_consensus_stage(8, stage_total, "Building division candidates and fragment-graph summary.")
@@ -959,6 +1437,7 @@ def build_source_fragments(
     solution: SolutionIndex,
     matches_by_frame: tuple[FrameMatches, ...],
     source_name: str,
+    overlap_signatures_by_frame: tuple[dict[int, tuple[int, ...]], ...],
 ) -> tuple[HypothesisTracklet, ...]:
     partner_lookup = [
         frame_matches.source_1_to_2 if source_name == solution.solution.source_name else frame_matches.source_2_to_1
@@ -975,11 +1454,14 @@ def build_source_fragments(
     ):
         boundaries = [row.begin]
         last_partner = partner_lookup[row.begin].get(row.track_id) if row.begin < len(partner_lookup) else None
+        last_signature = overlap_signatures_by_frame[row.begin].get(row.track_id, ()) if row.begin < len(overlap_signatures_by_frame) else ()
         for frame_index in range(row.begin + 1, row.end + 1):
             current_partner = partner_lookup[frame_index].get(row.track_id) if frame_index < len(partner_lookup) else None
-            if current_partner != last_partner:
+            current_signature = overlap_signatures_by_frame[frame_index].get(row.track_id, ()) if frame_index < len(overlap_signatures_by_frame) else ()
+            if current_partner != last_partner or current_signature != last_signature:
                 boundaries.append(frame_index)
             last_partner = current_partner
+            last_signature = current_signature
         boundaries.append(row.end + 1)
         for begin, stop in zip(boundaries, boundaries[1:]):
             end = stop - 1
@@ -996,6 +1478,49 @@ def build_source_fragments(
             )
             next_tracklet_id += 1
     return tuple(fragments)
+
+
+def build_significant_overlap_signatures(
+    solution_1: SolutionIndex,
+    solution_2: SolutionIndex,
+    iou_threshold: float,
+) -> dict[str, tuple[dict[int, tuple[int, ...]], ...]]:
+    left_signatures: list[dict[int, tuple[int, ...]]] = []
+    right_signatures: list[dict[int, tuple[int, ...]]] = []
+    frame_pairs = zip(solution_1.solution.frames, solution_2.solution.frames, strict=True)
+    for frame_left, frame_right in frame_pairs:
+        left_neighbors: dict[int, set[int]] = defaultdict(set)
+        right_neighbors: dict[int, set[int]] = defaultdict(set)
+        for (track_id_left, track_id_right), pixels in intersection_areas(frame_left, frame_right).items():
+            if not significant_cross_overlap(
+                frame_left,
+                track_id_left,
+                frame_right,
+                track_id_right,
+                int(pixels),
+                iou_threshold=iou_threshold,
+            ):
+                continue
+            left_neighbors[track_id_left].add(track_id_right)
+            right_neighbors[track_id_right].add(track_id_left)
+        left_signatures.append(
+            {
+                track_id: tuple(sorted(neighbors))
+                for track_id, neighbors in left_neighbors.items()
+                if neighbors
+            }
+        )
+        right_signatures.append(
+            {
+                track_id: tuple(sorted(neighbors))
+                for track_id, neighbors in right_neighbors.items()
+                if neighbors
+            }
+        )
+    return {
+        solution_1.solution.source_name: tuple(left_signatures),
+        solution_2.solution.source_name: tuple(right_signatures),
+    }
 
 
 def build_common_tracklets(
@@ -1228,6 +1753,7 @@ def build_continuation_candidates(
     nodes: tuple[TrackletNode, ...],
     indexed_solutions: dict[str, SolutionIndex],
 ) -> tuple[ContinuationCandidate, ...]:
+    del indexed_solutions
     nodes_by_begin: dict[int, list[TrackletNode]] = defaultdict(list)
     candidates: list[ContinuationCandidate] = []
     for node in nodes:
@@ -1239,44 +1765,19 @@ def build_continuation_candidates(
         total=len(nodes),
         unit="node",
     ):
-        for begin_frame in (parent.end, parent.end + 1):
-            for child in nodes_by_begin.get(begin_frame, []):
-                if parent.node_id == child.node_id:
-                    continue
-                if child.begin < parent.begin:
-                    continue
-                if centroid_distance(parent.end_stats, child.start_stats) > config.max_distance:
-                    continue
-                if child.begin == parent.end + 1:
-                    candidates.append(
-                        ContinuationCandidate(
-                            parent_id=parent.node_id,
-                            child_id=child.node_id,
-                            shared_boundary_frame=None,
-                            overlap_pixels=0,
-                            overlap_fraction=0.0,
-                        )
-                    )
-                    continue
-
-                overlap_pixels, overlap_fraction = boundary_overlap_details(parent, child, parent.end, indexed_solutions)
-                if overlap_pixels == 0:
-                    continue
-                smaller_area = min(parent.end_stats.area, child.start_stats.area)
-                if (
-                    overlap_pixels <= HANDOFF_OVERLAP_ABSOLUTE_PIXELS
-                    and smaller_area > 0
-                    and overlap_fraction <= HANDOFF_OVERLAP_RELATIVE_FRACTION
-                ):
-                    candidates.append(
-                        ContinuationCandidate(
-                            parent_id=parent.node_id,
-                            child_id=child.node_id,
-                            shared_boundary_frame=parent.end,
-                            overlap_pixels=overlap_pixels,
-                            overlap_fraction=overlap_fraction,
-                        )
-                    )
+        for child in nodes_by_begin.get(parent.end + 1, []):
+            if parent.node_id == child.node_id:
+                continue
+            if child.begin < parent.begin:
+                continue
+            if centroid_distance(parent.end_stats, child.start_stats) > config.max_distance:
+                continue
+            candidates.append(
+                ContinuationCandidate(
+                    parent_id=parent.node_id,
+                    child_id=child.node_id,
+                )
+            )
     unique_candidates = {
         (candidate.parent_id, candidate.child_id): candidate
         for candidate in candidates
@@ -1322,6 +1823,7 @@ def compute_overlap_pairs(
     nodes: tuple[TrackletNode, ...],
     frame_index: NodeFrameIndex,
     source_names: tuple[str, str],
+    indexed_solutions: dict[str, SolutionIndex],
 ) -> tuple[frozenset[int], ...]:
     pair_set: set[frozenset[int]] = set()
     source_name_1, source_name_2 = source_names
@@ -1329,6 +1831,8 @@ def compute_overlap_pairs(
     source_nodes_2 = frame_index.source_nodes_by_frame_track[source_name_2]
     common_tracks_1 = frame_index.common_nodes_by_frame_source_track[source_name_1]
     common_tracks_2 = frame_index.common_nodes_by_frame_source_track[source_name_2]
+    frames_1 = indexed_solutions[source_name_1].solution.frames
+    frames_2 = indexed_solutions[source_name_2].solution.frames
 
     for frame_number, overlaps in progress_iter(
         enumerate(frame_index.cross_overlap_by_frame),
@@ -1336,7 +1840,18 @@ def compute_overlap_pairs(
         total=len(frame_index.cross_overlap_by_frame),
         unit="frame",
     ):
-        for (track_id_1, track_id_2), _pixels in overlaps.items():
+        frame_left = frames_1[frame_number]
+        frame_right = frames_2[frame_number]
+        for (track_id_1, track_id_2), pixels in overlaps.items():
+            if not significant_cross_overlap(
+                frame_left,
+                track_id_1,
+                frame_right,
+                track_id_2,
+                int(pixels),
+                iou_threshold=CROSS_SOURCE_CONFLICT_IOU_THRESHOLD,
+            ):
+                continue
             node_id_1 = source_nodes_1[frame_number].get(track_id_1)
             node_id_2 = source_nodes_2[frame_number].get(track_id_2)
             if node_id_1 and node_id_2:
@@ -1369,6 +1884,31 @@ def compute_overlap_pairs(
     return tuple(sorted(pair_set, key=lambda pair: tuple(sorted(pair))))
 
 
+def significant_cross_overlap(
+    frame_left,
+    track_id_left: int,
+    frame_right,
+    track_id_right: int,
+    overlap_pixels: int,
+    *,
+    iou_threshold: float,
+) -> bool:
+    if overlap_pixels <= 0:
+        return False
+    left_index = frame_left.raw_label_to_index.get(track_id_left)
+    right_index = frame_right.raw_label_to_index.get(track_id_right)
+    if left_index is None or right_index is None:
+        return False
+    left_area = int(frame_left.areas[left_index])
+    right_area = int(frame_right.areas[right_index])
+    union = left_area + right_area - int(overlap_pixels)
+    if union <= 0:
+        return False
+    smaller_fraction = float(overlap_pixels / max(1, min(left_area, right_area)))
+    iou = float(overlap_pixels / union)
+    return iou >= iou_threshold or smaller_fraction >= SIGNIFICANT_OVERLAP_SMALLER_FRACTION
+
+
 def summarize_fragment_graph(
     nodes: tuple[TrackletNode, ...],
     continuation_candidates: tuple[ContinuationCandidate, ...],
@@ -1379,13 +1919,11 @@ def summarize_fragment_graph(
     for node in nodes:
         if node.source_name is not None:
             source_counts[node.source_name] += 1
-    tolerated = [candidate for candidate in continuation_candidates if candidate.is_tolerated_handoff]
     return {
         "common_supported_fragment_count": len([node for node in nodes if node.is_common_supported]),
         "source_specific_fragment_count": len([node for node in nodes if not node.is_common_supported]),
         "source_specific_fragment_count_by_source": dict(sorted(source_counts.items())),
         "hard_conflict_count": len(hard_conflicts),
-        "tolerated_handoff_pair_count": len(tolerated),
         "move_edge_count": len(continuation_candidates),
         "division_edge_count": len(division_candidates),
     }
@@ -1396,6 +1934,7 @@ def solve_global_tracklet_ilp(
     preparation: ConsensusPreparation,
     indexed_solutions: dict[str, SolutionIndex],
     scorers: EventScorers,
+    extra_hard_conflicts: tuple[frozenset[int], ...] = (),
 ) -> tuple[
     set[int],
     dict[int, tuple[str, int] | tuple[str, int, int] | None],
@@ -1409,7 +1948,20 @@ def solve_global_tracklet_ilp(
         return set(), {}, {}, {"selected_total_count": 0}
 
     node_lookup = {node.node_id: node for node in nodes}
-    continuation_lookup = {(candidate.parent_id, candidate.child_id): candidate for candidate in preparation.continuation_candidates}
+    source_names = tuple(config.consensus_sources)
+    total_frame_count = len(next(iter(indexed_solutions.values())).solution.frames)
+    move_support_scores = build_move_source_support_scores(
+        source_names,
+        preparation.continuation_candidates,
+        node_lookup,
+        indexed_solutions,
+    )
+    division_support_scores = build_division_source_support_scores(
+        source_names,
+        preparation.division_candidates,
+        node_lookup,
+        indexed_solutions,
+    )
 
     model = gp.Model("PyTr2dConsensus")
     model.Params.OutputFlag = 1
@@ -1456,8 +2008,12 @@ def solve_global_tracklet_ilp(
         disappearance = model.addVar(vtype=GRB.BINARY, name=f"dis[{node.node_id}]")
         appearance_vars[node.node_id] = appearance
         disappearance_vars[node.node_id] = disappearance
-        objective_terms.append(appearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * appearance)
-        objective_terms.append(disappearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * disappearance)
+        objective_terms.append(
+            appearance_cost(config, scorers, node, total_frame_count) * BOUNDARY_PENALTY_SCALE * appearance
+        )
+        objective_terms.append(
+            disappearance_cost(config, scorers, node, total_frame_count) * BOUNDARY_PENALTY_SCALE * disappearance
+        )
 
     for candidate in progress_iter(
         preparation.continuation_candidates,
@@ -1471,7 +2027,9 @@ def solve_global_tracklet_ilp(
         move_vars[(candidate.parent_id, candidate.child_id)] = variable
         outgoing_terms[candidate.parent_id].append(variable)
         incoming_terms[candidate.child_id].append(variable)
-        objective_terms.append(move_cost(scorers, parent, child) * variable)
+        objective_terms.append(
+            move_cost(scorers, parent, child) * variable
+        )
 
     for parent_id, child_id_1, child_id_2 in progress_iter(
         preparation.division_candidates,
@@ -1487,7 +2045,9 @@ def solve_global_tracklet_ilp(
         outgoing_terms[parent_id].append(variable)
         incoming_terms[child_id_1].append(variable)
         incoming_terms[child_id_2].append(variable)
-        objective_terms.append(division_cost(scorers, parent, child_1, child_2) * variable)
+        objective_terms.append(
+            division_cost(config, scorers, parent, child_1, child_2, indexed_solutions, internal_consistency_cache) * variable
+        )
 
     constraint_count = 0
     for node in progress_iter(
@@ -1508,7 +2068,9 @@ def solve_global_tracklet_ilp(
         )
         constraint_count += 1
 
-    sorted_hard_conflicts = sorted((tuple(sorted(pair)) for pair in preparation.hard_conflicts))
+    static_hard_conflicts = set(normalize_conflict_pairs(preparation.hard_conflicts))
+    static_hard_conflicts.update(normalize_conflict_pairs(extra_hard_conflicts))
+    sorted_hard_conflicts = tuple(sorted(static_hard_conflicts))
     for left_id, right_id in progress_iter(
         sorted_hard_conflicts,
         desc="Consensus ILP build: hard-conflict constraints",
@@ -1521,24 +2083,8 @@ def solve_global_tracklet_ilp(
         )
         constraint_count += 1
 
-    tolerated_handoff_count = 0
-    for candidate in progress_iter(
-        preparation.continuation_candidates,
-        desc="Consensus ILP build: handoff constraints",
-        total=len(preparation.continuation_candidates),
-        unit="edge",
-    ):
-        if not candidate.is_tolerated_handoff:
-            continue
-        tolerated_handoff_count += 1
-        model.addConstr(
-            activation_vars[candidate.parent_id] + activation_vars[candidate.child_id] - move_vars[(candidate.parent_id, candidate.child_id)] <= 1,
-            name=f"handoff[{candidate.parent_id},{candidate.child_id}]",
-        )
-        constraint_count += 1
-
     LOGGER.info(
-        "Consensus ILP: nodes=%s, common_supported=%s, source_specific=%s, move=%s, division=%s, constraints=%s, hard_conflicts=%s, tolerated_handoffs=%s.",
+        "Consensus ILP: nodes=%s, common_supported=%s, source_specific=%s, move=%s, division=%s, constraints=%s, hard_conflicts=%s.",
         len(nodes),
         len([node for node in nodes if node.is_common_supported]),
         len([node for node in nodes if not node.is_common_supported]),
@@ -1546,7 +2092,6 @@ def solve_global_tracklet_ilp(
         len(division_vars),
         constraint_count,
         len(preparation.hard_conflicts),
-        tolerated_handoff_count,
     )
     model.setObjective(quicksum(objective_terms), GRB.MINIMIZE)
     LOGGER.info("Starting Gurobi optimization for consensus ILP.")
@@ -1580,6 +2125,8 @@ def solve_global_tracklet_ilp(
     selected_source_counts: dict[str, int] = defaultdict(int)
     selected_common_count = 0
     cross_source_continuations = 0
+    selected_move_keys: list[tuple[int, int]] = []
+    selected_division_keys: list[tuple[int, int, int]] = []
     for node_id in selected_nodes:
         node = node_lookup[node_id]
         if node.is_common_supported:
@@ -1589,10 +2136,14 @@ def solve_global_tracklet_ilp(
     for (parent_id, child_id), variable in move_vars.items():
         if variable.X <= 0.5:
             continue
+        selected_move_keys.append((parent_id, child_id))
         parent = node_lookup[parent_id]
         child = node_lookup[child_id]
         if dominant_source(parent) != dominant_source(child):
             cross_source_continuations += 1
+    for key, variable in division_vars.items():
+        if variable.X > 0.5:
+            selected_division_keys.append(key)
 
     LOGGER.info("Consensus ILP selected %s fragment node(s).", len(selected_nodes))
     return selected_nodes, incoming_choice, outgoing_choice, {
@@ -1600,6 +2151,13 @@ def solve_global_tracklet_ilp(
         "selected_common_supported_count": selected_common_count,
         "selected_source_specific_count_by_source": dict(sorted(selected_source_counts.items())),
         "selected_cross_source_continuation_count": cross_source_continuations,
+        **relation_support_selection_diagnostics(
+            source_names,
+            move_support_scores,
+            selected_move_keys,
+            division_support_scores,
+            selected_division_keys,
+        ),
     }
 
 
@@ -1907,6 +2465,7 @@ def solve_joint_tracklet_geometry_ilp(
     preparation: ConsensusPreparation,
     indexed_solutions: dict[str, SolutionIndex],
     scorers: EventScorers,
+    extra_hard_conflicts: tuple[frozenset[int], ...] = (),
 ) -> tuple[
     set[int],
     dict[int, tuple[str, int] | tuple[str, int, int] | None],
@@ -1927,6 +2486,18 @@ def solve_joint_tracklet_geometry_ilp(
     option_names = geometry_option_names(source_names)
     common_node_ids = [node.node_id for node in nodes if node.is_common_supported]
     source_node_ids = [node.node_id for node in nodes if not node.is_common_supported]
+    move_support_scores = build_move_source_support_scores(
+        source_names,
+        preparation.continuation_candidates,
+        node_lookup,
+        indexed_solutions,
+    )
+    division_support_scores = build_division_source_support_scores(
+        source_names,
+        preparation.division_candidates,
+        node_lookup,
+        indexed_solutions,
+    )
     source_specific_hard_conflicts = tuple(
         pair
         for pair in preparation.hard_conflicts
@@ -2010,8 +2581,12 @@ def solve_joint_tracklet_geometry_ilp(
         disappearance = model.addVar(vtype=GRB.BINARY, name=f"dis[{node.node_id}]")
         appearance_vars[node.node_id] = appearance
         disappearance_vars[node.node_id] = disappearance
-        objective_terms.append(appearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * appearance)
-        objective_terms.append(disappearance_cost(scorers, node) * BOUNDARY_PENALTY_SCALE * disappearance)
+        objective_terms.append(
+            appearance_cost(config, scorers, node, frame_count) * BOUNDARY_PENALTY_SCALE * appearance
+        )
+        objective_terms.append(
+            disappearance_cost(config, scorers, node, frame_count) * BOUNDARY_PENALTY_SCALE * disappearance
+        )
 
     for candidate in progress_iter(
         preparation.continuation_candidates,
@@ -2025,7 +2600,14 @@ def solve_joint_tracklet_geometry_ilp(
         move_vars[(candidate.parent_id, candidate.child_id)] = variable
         outgoing_terms[candidate.parent_id].append(variable)
         incoming_terms[candidate.child_id].append(variable)
-        objective_terms.append(move_cost(scorers, parent, child) * variable)
+        objective_terms.append(
+            (
+                move_cost(scorers, parent, child)
+                - MOVE_SOURCE_LINEAGE_SUPPORT_REWARD
+                * move_support_scores.get((candidate.parent_id, candidate.child_id), 0)
+            )
+            * variable
+        )
 
     for parent_id, child_id_1, child_id_2 in progress_iter(
         preparation.division_candidates,
@@ -2041,7 +2623,14 @@ def solve_joint_tracklet_geometry_ilp(
         outgoing_terms[parent_id].append(variable)
         incoming_terms[child_id_1].append(variable)
         incoming_terms[child_id_2].append(variable)
-        objective_terms.append(division_cost(scorers, parent, child_1, child_2) * variable)
+        objective_terms.append(
+            (
+                division_cost(config, scorers, parent, child_1, child_2, indexed_solutions, internal_consistency_cache)
+                - DIVISION_SOURCE_LINEAGE_SUPPORT_REWARD
+                * division_support_scores.get((parent_id, child_id_1, child_id_2), 0)
+            )
+            * variable
+        )
 
     constraint_count = 0
     for node in progress_iter(
@@ -2055,30 +2644,18 @@ def solve_joint_tracklet_geometry_ilp(
         model.addConstr(quicksum(outgoing_terms[node.node_id]) + disappearance_vars[node.node_id] == target, name=f"outgoing[{node.node_id}]")
         constraint_count += 2
 
-    sorted_hard_conflicts = sorted((tuple(sorted(pair)) for pair in source_specific_hard_conflicts))
+    static_hard_conflicts = set(normalize_conflict_pairs(source_specific_hard_conflicts))
+    static_hard_conflicts.update(normalize_conflict_pairs(extra_hard_conflicts))
+    sorted_hard_conflicts = tuple(sorted(static_hard_conflicts))
     for left_id, right_id in progress_iter(
         sorted_hard_conflicts,
-        desc="Joint ILP build: source-specific hard conflicts",
+        desc="Joint ILP build: static hard conflicts",
         total=len(sorted_hard_conflicts),
         unit="pair",
     ):
         model.addConstr(
             activation_vars[left_id] + activation_vars[right_id] <= 1,
             name=f"conflict_static[{left_id},{right_id}]",
-        )
-        constraint_count += 1
-
-    for candidate in progress_iter(
-        preparation.continuation_candidates,
-        desc="Joint ILP build: tolerated handoff constraints",
-        total=len(preparation.continuation_candidates),
-        unit="edge",
-    ):
-        if not candidate.is_tolerated_handoff:
-            continue
-        model.addConstr(
-            activation_vars[candidate.parent_id] + activation_vars[candidate.child_id] - move_vars[(candidate.parent_id, candidate.child_id)] <= 1,
-            name=f"handoff[{candidate.parent_id},{candidate.child_id}]",
         )
         constraint_count += 1
 
@@ -2370,6 +2947,8 @@ def solve_joint_tracklet_geometry_ilp(
     selected_source_counts: dict[str, int] = defaultdict(int)
     selected_common_count = 0
     cross_source_continuations = 0
+    selected_move_keys: list[tuple[int, int]] = []
+    selected_division_keys: list[tuple[int, int, int]] = []
     for node_id in selected_nodes:
         node = node_lookup[node_id]
         if node.is_common_supported:
@@ -2379,16 +2958,27 @@ def solve_joint_tracklet_geometry_ilp(
     for (parent_id, child_id), variable in move_vars.items():
         if variable.X <= 0.5:
             continue
+        selected_move_keys.append((parent_id, child_id))
         parent = node_lookup[parent_id]
         child = node_lookup[child_id]
         if dominant_source(parent) != dominant_source(child):
             cross_source_continuations += 1
+    for key, variable in division_vars.items():
+        if variable.X > 0.5:
+            selected_division_keys.append(key)
 
     selected_graph_stats = {
         "selected_total_count": len(selected_nodes),
         "selected_common_supported_count": selected_common_count,
         "selected_source_specific_count_by_source": dict(sorted(selected_source_counts.items())),
         "selected_cross_source_continuation_count": cross_source_continuations,
+        **relation_support_selection_diagnostics(
+            source_names,
+            move_support_scores,
+            selected_move_keys,
+            division_support_scores,
+            selected_division_keys,
+        ),
     }
     geometry_diag = geometry_diagnostics(
         common_geometry_assignments=assignments,
@@ -2868,26 +3458,20 @@ def render_variant_masks(
     common_geometry_assignments: dict[int, str] | None = None,
 ) -> np.ndarray:
     tracked_masks = np.zeros((len(raw_frames), *raw_frames[0].shape), dtype=np.uint16)
-    selected_node_list = list(node for node in nodes if node.node_id in selected_nodes)
-    selected_node_list.sort(
-        key=lambda item: (
-            node_to_final_track[item.node_id],
-            item.begin,
-            0 if item.is_common_supported else 1,
-            item.node_id,
-        )
-    )
+    owner_masks = np.zeros((len(raw_frames), *raw_frames[0].shape), dtype=np.int32)
+    nodes_by_id = {node.node_id: node for node in nodes}
+    node_total_area = build_node_total_area(nodes, indexed_solutions)
 
-    for node in selected_node_list:
+    for node in selected_nodes_in_render_order(nodes, selected_nodes, node_to_final_track):
         track_id = node_to_final_track[node.node_id]
         for frame_index in range(node.begin, node.end + 1):
-            if common_geometry_assignments is not None and node.is_common_supported:
-                assigned_option = common_geometry_assignments.get(node.node_id)
-                if assigned_option is None:
-                    raise ValueError(f"Missing geometry assignment for selected common-supported fragment {node.node_id}.")
-                coords = node_coords_for_option(node, assigned_option, frame_index, indexed_solutions)
-            else:
-                coords = node_variant_coords(variant_name, node, frame_index, indexed_solutions)
+            coords = node_render_coords(
+                variant_name=variant_name,
+                node=node,
+                frame_index=frame_index,
+                indexed_solutions=indexed_solutions,
+                common_geometry_assignments=common_geometry_assignments,
+            )
             if coords.size == 0:
                 continue
             frame_mask = tracked_masks[frame_index]
@@ -2899,10 +3483,21 @@ def render_variant_masks(
                 coords=coords,
                 frame_mask=frame_mask,
                 indexed_solutions=indexed_solutions,
+                frame_owner_mask=owner_masks[frame_index],
+                node_to_final_track=node_to_final_track,
+                nodes_by_id=nodes_by_id,
+                node_total_area=node_total_area,
             )
             if coords.size == 0:
                 continue
             frame_mask[coords[:, 0], coords[:, 1]] = np.uint16(track_id)
+            owner_masks[frame_index][coords[:, 0], coords[:, 1]] = np.int32(node.node_id + 1)
+    for frame_index, frame_mask in enumerate(tracked_masks):
+        projectio.validate_single_component_labels(
+            frame_mask,
+            f"consensus variant '{variant_name}' frame {frame_index:03d}",
+            kind="Consensus tracked mask",
+        )
     return tracked_masks
 
 
@@ -2914,42 +3509,94 @@ def resolve_render_conflicts(
     coords: np.ndarray,
     frame_mask: np.ndarray,
     indexed_solutions: dict[str, SolutionIndex],
+    frame_owner_mask: np.ndarray | None = None,
+    node_to_final_track: dict[int, int] | None = None,
+    nodes_by_id: dict[int, TrackletNode] | None = None,
+    node_total_area: dict[int, int] | None = None,
 ) -> np.ndarray:
-    existing_labels = frame_mask[coords[:, 0], coords[:, 1]]
-    available = (existing_labels == 0) | (existing_labels == track_id)
-    if np.all(available):
-        return coords
-
-    if variant_name == "union" and node.is_common_supported:
-        clipped_coords = np.asarray(coords[available], dtype=np.int32)
-        clipped_pixels = int(np.count_nonzero(~available))
-        if clipped_coords.size > 0:
-            LOGGER.warning(
-                "Variant '%s' clipped %s pixel(s) from common-supported fragment %s at frame %03d to avoid overlap.",
-                variant_name,
-                clipped_pixels,
-                node.node_id,
-                frame_index,
-            )
-            return clipped_coords
-
-        fallback_coords = node_variant_coords("intersection", node, frame_index, indexed_solutions)
-        if fallback_coords.size > 0:
-            fallback_existing = frame_mask[fallback_coords[:, 0], fallback_coords[:, 1]]
-            fallback_available = (fallback_existing == 0) | (fallback_existing == track_id)
-            fallback_coords = np.asarray(fallback_coords[fallback_available], dtype=np.int32)
-            if fallback_coords.size > 0:
-                LOGGER.warning(
-                    "Variant '%s' fell back to intersection geometry for common-supported fragment %s at frame %03d because union geometry was fully occupied.",
-                    variant_name,
-                    node.node_id,
-                    frame_index,
-                )
-                return fallback_coords
-
-    raise ValueError(
-        f"Variant '{variant_name}' contains overlapping selected tracklets at frame {frame_index}."
+    resolution = analyze_render_conflicts(
+        variant_name=variant_name,
+        node=node,
+        track_id=track_id,
+        frame_index=frame_index,
+        coords=coords,
+        frame_mask=frame_mask,
+        indexed_solutions=indexed_solutions,
     )
+    if resolution.action == "all_available":
+        return coords
+    if resolution.action == "union_clip":
+        LOGGER.warning(
+            "Variant '%s' clipped %s pixel(s) from common-supported fragment %s at frame %03d to avoid overlap.",
+            variant_name,
+            resolution.clipped_pixels,
+            node.node_id,
+            frame_index,
+        )
+        return resolution.resolved_coords
+    if resolution.action == "union_intersection_fallback":
+        LOGGER.warning(
+            "Variant '%s' fell back to intersection geometry for common-supported fragment %s at frame %03d because union geometry was fully occupied.",
+            variant_name,
+            node.node_id,
+            frame_index,
+        )
+        return resolution.resolved_coords
+    if resolution.action == "small_clip":
+        LOGGER.warning(
+            "Variant '%s' clipped %s pixel(s) (%.1f%%) from fragment %s at frame %03d to resolve a small overlap.",
+            variant_name,
+            resolution.clipped_pixels,
+            100.0 * resolution.clipped_fraction,
+            node.node_id,
+            frame_index,
+        )
+        return resolution.resolved_coords
+
+    reassigned_coords = resolve_overlap_to_smaller(
+        variant_name=variant_name,
+        node=node,
+        frame_index=frame_index,
+        coords=coords,
+        resolution=resolution,
+        frame_mask=frame_mask,
+        frame_owner_mask=frame_owner_mask,
+        nodes_by_id=nodes_by_id,
+        node_total_area=node_total_area,
+        log_action=True,
+    )
+    if reassigned_coords is not None:
+        return reassigned_coords
+
+    message = (
+        f"Variant '{variant_name}' contains overlapping selected tracklets at frame {frame_index}: "
+        f"fragment {node.node_id} cannot be rendered because "
+        f"{format_render_conflict_failure_reason(resolution.failure_reason or 'unknown', clipped_fraction=resolution.clipped_fraction)}."
+    )
+    if frame_owner_mask is not None and node_to_final_track is not None:
+        unavailable_coords = np.asarray(coords[~resolution.available_mask], dtype=np.int32)
+        conflicting_node_ids = sorted(
+            {
+                int(owner_id) - 1
+                for owner_id in frame_owner_mask[unavailable_coords[:, 0], unavailable_coords[:, 1]]
+                if int(owner_id) > 0
+            }
+        )
+        if conflicting_node_ids:
+            pair_details = ", ".join(
+                f"{conflicting_node_id}(track {node_to_final_track.get(conflicting_node_id, -1)})"
+                for conflicting_node_id in conflicting_node_ids
+            )
+            message += f" Conflicts with fragment(s) {pair_details}."
+    raise ValueError(message)
+
+
+def clipped_coords_form_single_component(coords: np.ndarray, shape: tuple[int, int]) -> bool:
+    if coords.size == 0:
+        return False
+    mask = np.zeros(shape, dtype=np.uint8)
+    mask[coords[:, 0], coords[:, 1]] = 1
+    return not projectio.disconnected_label_components(mask)
 
 
 def summarize_variant(
@@ -2978,8 +3625,13 @@ def input_solution_metrics(
 ) -> dict[str, dict[str, object]]:
     try:
         raw_frames = projectio.load_raw_sequence(dataset_root, track_sequence)
-        gt_frames = projectio.load_gt_frame_objects(dataset_root, track_sequence, raw_frames)
-        gt_rows = tuple(projectio.load_lineage_records(dataset_root, track_sequence).values())
+        gt_frames, gt_records = projectio.load_gt_tracking_reference(
+            dataset_root,
+            track_sequence,
+            raw_frames,
+            ignore_disconnected_tracks=True,
+        )
+        gt_rows = tuple(gt_records.values())
         gt_solution = build_solution_index(
             SavedTrackingSolution(
                 source_name="gt",
@@ -3091,9 +3743,14 @@ def candidate_oracle_metrics(
         LOGGER.info("Candidate-oracle diagnostics: loading raw sequence '%s'.", config.track_sequence)
         raw_frames = projectio.load_raw_sequence(config.dataset_root, config.track_sequence)
         LOGGER.info("Candidate-oracle diagnostics: loading GT masks for sequence '%s'.", config.track_sequence)
-        gt_frames = projectio.load_gt_frame_objects(config.dataset_root, config.track_sequence, raw_frames)
-        LOGGER.info("Candidate-oracle diagnostics: loading GT lineage rows for sequence '%s'.", config.track_sequence)
-        gt_rows = tuple(projectio.load_lineage_records(config.dataset_root, config.track_sequence).values())
+        gt_frames, gt_records = projectio.load_gt_tracking_reference(
+            config.dataset_root,
+            config.track_sequence,
+            raw_frames,
+            ignore_disconnected_tracks=True,
+        )
+        LOGGER.info("Candidate-oracle diagnostics: loaded filtered GT lineage rows for sequence '%s'.", config.track_sequence)
+        gt_rows = tuple(gt_records.values())
     except ValueError:
         return {"status": "skipped", "reason": "Ground-truth tracking data is unavailable for candidate-oracle diagnostics."}
 
@@ -3484,14 +4141,21 @@ def fragment_bonus(
     indexed_solutions: dict[str, SolutionIndex],
     internal_consistency_cache: dict[int, float],
 ) -> gp.LinExpr:
-    internal_consistency = node_internal_consistency(node, scorers, indexed_solutions, internal_consistency_cache)
-    if node.is_common_supported:
-        confidence = float(np.mean([internal_consistency, node.mean_iou, node.agreement_strength]))
-        scale = COMMON_FRAGMENT_BONUS_SCALE
-    else:
-        confidence = internal_consistency
-        scale = SOURCE_FRAGMENT_BONUS_SCALE
+    confidence = node_tracklet_quality(node, scorers, indexed_solutions, internal_consistency_cache)
+    scale = COMMON_FRAGMENT_BONUS_SCALE if node.is_common_supported else SOURCE_FRAGMENT_BONUS_SCALE
     return (-scale * confidence * node.frame_count) * activation
+
+
+def node_tracklet_quality(
+    node: TrackletNode,
+    scorers: EventScorers,
+    indexed_solutions: dict[str, SolutionIndex],
+    cache: dict[int, float],
+) -> float:
+    internal_consistency = node_internal_consistency(node, scorers, indexed_solutions, cache)
+    if node.is_common_supported:
+        return float(np.mean([internal_consistency, node.mean_iou, node.agreement_strength]))
+    return internal_consistency
 
 
 def node_internal_consistency(
@@ -3519,6 +4183,18 @@ def node_internal_consistency(
     consistency = float(np.mean(probabilities)) if probabilities else 0.5
     cache[node.node_id] = consistency
     return consistency
+
+
+def node_persistence_score(
+    node: TrackletNode,
+    scorers: EventScorers,
+    indexed_solutions: dict[str, SolutionIndex],
+    cache: dict[int, float],
+) -> float:
+    if node.frame_count <= 1:
+        return 0.0
+    length_factor = min(1.0, max(0, node.frame_count - 1) / PERSISTENCE_TARGET_FRAMES)
+    return length_factor * node_tracklet_quality(node, scorers, indexed_solutions, cache)
 
 
 def internal_move_probabilities(
@@ -3549,7 +4225,183 @@ def positive_probability(model: object, features: tuple[float, ...]) -> float:
     return max(0.0, min(1.0, probability))
 
 
-def move_cost(scorers: EventScorers, parent: TrackletNode, child: TrackletNode) -> float:
+def short_fragment_boundary_penalty(
+    node: TrackletNode,
+    total_frame_count: int,
+    max_short_length: int,
+) -> float:
+    if max_short_length <= 0 or node.frame_count > max_short_length:
+        return 0.0
+    if node.begin <= 0 or node.end >= total_frame_count - 1:
+        return 0.0
+    interior_border_distance = min(node.start_stats.border_distance, node.end_stats.border_distance)
+    if interior_border_distance < SHORT_INTERIOR_BORDER_DISTANCE_THRESHOLD:
+        return 0.0
+    return float((max_short_length - node.frame_count + 1) / max_short_length)
+
+
+def source_track_id_for_node(node: TrackletNode, source_name: str) -> int | None:
+    if node.source_name == source_name:
+        return node.source_track_id
+    if node.source_names is None or node.source_track_ids is None:
+        return None
+    for name, track_id in zip(node.source_names, node.source_track_ids, strict=True):
+        if name == source_name:
+            return track_id
+    return None
+
+
+def source_supports_continuation(
+    parent: TrackletNode,
+    child: TrackletNode,
+    source_name: str,
+    indexed_solutions: dict[str, SolutionIndex],
+) -> bool:
+    if child.begin != parent.end + 1:
+        return False
+    parent_track_id = source_track_id_for_node(parent, source_name)
+    child_track_id = source_track_id_for_node(child, source_name)
+    if parent_track_id is None or child_track_id is None or parent_track_id != child_track_id:
+        return False
+    row = indexed_solutions[source_name].rows_by_track.get(parent_track_id)
+    if row is None:
+        return False
+    return row.begin <= parent.begin and row.end >= child.end
+
+
+def source_supports_division(
+    parent: TrackletNode,
+    child_1: TrackletNode,
+    child_2: TrackletNode,
+    source_name: str,
+    indexed_solutions: dict[str, SolutionIndex],
+) -> bool:
+    if child_1.begin != parent.end + 1 or child_2.begin != parent.end + 1:
+        return False
+    parent_track_id = source_track_id_for_node(parent, source_name)
+    child_track_id_1 = source_track_id_for_node(child_1, source_name)
+    child_track_id_2 = source_track_id_for_node(child_2, source_name)
+    if (
+        parent_track_id is None
+        or child_track_id_1 is None
+        or child_track_id_2 is None
+        or child_track_id_1 == child_track_id_2
+    ):
+        return False
+    solution = indexed_solutions[source_name]
+    parent_row = solution.rows_by_track.get(parent_track_id)
+    child_row_1 = solution.rows_by_track.get(child_track_id_1)
+    child_row_2 = solution.rows_by_track.get(child_track_id_2)
+    if parent_row is None or child_row_1 is None or child_row_2 is None:
+        return False
+    if parent_row.begin > parent.begin or parent_row.end < parent.end:
+        return False
+    if child_row_1.begin > child_1.begin or child_row_1.end < child_1.end:
+        return False
+    if child_row_2.begin > child_2.begin or child_row_2.end < child_2.end:
+        return False
+    if child_row_1.parent != parent_track_id or child_row_2.parent != parent_track_id:
+        return False
+    source_children = solution.children_by_parent.get(parent_track_id, ())
+    return set(source_children) == {child_track_id_1, child_track_id_2}
+
+
+def continuation_source_support_score(
+    parent: TrackletNode,
+    child: TrackletNode,
+    source_names: tuple[str, ...],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> int:
+    return sum(
+        1
+        for source_name in source_names
+        if source_supports_continuation(parent, child, source_name, indexed_solutions)
+    )
+
+
+def division_source_support_score(
+    parent: TrackletNode,
+    child_1: TrackletNode,
+    child_2: TrackletNode,
+    source_names: tuple[str, ...],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> int:
+    return sum(
+        1
+        for source_name in source_names
+        if source_supports_division(parent, child_1, child_2, source_name, indexed_solutions)
+    )
+
+
+def build_move_source_support_scores(
+    source_names: tuple[str, ...],
+    continuation_candidates: tuple[ContinuationCandidate, ...],
+    node_lookup: dict[int, TrackletNode],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> dict[tuple[int, int], int]:
+    return {
+        (candidate.parent_id, candidate.child_id): continuation_source_support_score(
+            node_lookup[candidate.parent_id],
+            node_lookup[candidate.child_id],
+            source_names,
+            indexed_solutions,
+        )
+        for candidate in continuation_candidates
+    }
+
+
+def build_division_source_support_scores(
+    source_names: tuple[str, ...],
+    division_candidates: tuple[tuple[int, int, int], ...],
+    node_lookup: dict[int, TrackletNode],
+    indexed_solutions: dict[str, SolutionIndex],
+) -> dict[tuple[int, int, int], int]:
+    return {
+        (parent_id, child_id_1, child_id_2): division_source_support_score(
+            node_lookup[parent_id],
+            node_lookup[child_id_1],
+            node_lookup[child_id_2],
+            source_names,
+            indexed_solutions,
+        )
+        for parent_id, child_id_1, child_id_2 in division_candidates
+    }
+
+
+def support_level_counts(
+    scores: dict[tuple[int, ...], int],
+    selected_keys: list[tuple[int, ...]],
+    source_names: tuple[str, ...],
+) -> dict[str, int]:
+    counts = {str(level): 0 for level in range(len(source_names) + 1)}
+    for key in selected_keys:
+        level = str(scores.get(key, 0))
+        counts[level] = counts.get(level, 0) + 1
+    return counts
+
+
+def relation_support_selection_diagnostics(
+    source_names: tuple[str, ...],
+    move_support_scores: dict[tuple[int, int], int],
+    selected_move_keys: list[tuple[int, int]],
+    division_support_scores: dict[tuple[int, int, int], int],
+    selected_division_keys: list[tuple[int, int, int]],
+) -> dict[str, object]:
+    return {
+        "selected_move_support_count_by_level": support_level_counts(move_support_scores, selected_move_keys, source_names),
+        "selected_division_support_count_by_level": support_level_counts(
+            division_support_scores,
+            selected_division_keys,
+            source_names,
+        ),
+    }
+
+
+def move_cost(
+    scorers: EventScorers,
+    parent: TrackletNode,
+    child: TrackletNode,
+) -> float:
     features = (
         parent.end_stats.intensity_std,
         child.start_stats.intensity_std,
@@ -3560,7 +4412,15 @@ def move_cost(scorers: EventScorers, parent: TrackletNode, child: TrackletNode) 
     return probability_to_cost(scorers.move_model, features)
 
 
-def division_cost(scorers: EventScorers, parent: TrackletNode, child_1: TrackletNode, child_2: TrackletNode) -> float:
+def division_cost(
+    config: TrackingConfig,
+    scorers: EventScorers,
+    parent: TrackletNode,
+    child_1: TrackletNode,
+    child_2: TrackletNode,
+    indexed_solutions: dict[str, SolutionIndex],
+    internal_consistency_cache: dict[int, float],
+) -> float:
     features = (
         parent.end_stats.intensity_std,
         child_1.start_stats.intensity_std,
@@ -3572,11 +4432,23 @@ def division_cost(scorers: EventScorers, parent: TrackletNode, child_1: Tracklet
         child_1.start_stats.area,
         child_2.start_stats.area,
     )
-    return probability_to_cost(scorers.division_model, features)
+    base_cost = probability_to_cost(scorers.division_model, features)
+    persistence_reward = node_persistence_score(child_1, scorers, indexed_solutions, internal_consistency_cache) + node_persistence_score(
+        child_2,
+        scorers,
+        indexed_solutions,
+        internal_consistency_cache,
+    )
+    return base_cost - config.consensus_division_persistence_reward * persistence_reward
 
 
-def appearance_cost(scorers: EventScorers, node: TrackletNode) -> float:
-    return probability_to_cost(
+def appearance_cost(
+    config: TrackingConfig,
+    scorers: EventScorers,
+    node: TrackletNode,
+    total_frame_count: int,
+) -> float:
+    base_cost = probability_to_cost(
         scorers.appearance_model,
         (
             node.start_stats.intensity_std,
@@ -3584,16 +4456,31 @@ def appearance_cost(scorers: EventScorers, node: TrackletNode) -> float:
             node.start_stats.area,
         ),
     )
+    return base_cost + config.consensus_short_interior_penalty * short_fragment_boundary_penalty(
+        node,
+        total_frame_count,
+        config.consensus_short_fragment_max_length,
+    )
 
 
-def disappearance_cost(scorers: EventScorers, node: TrackletNode) -> float:
-    return probability_to_cost(
+def disappearance_cost(
+    config: TrackingConfig,
+    scorers: EventScorers,
+    node: TrackletNode,
+    total_frame_count: int,
+) -> float:
+    base_cost = probability_to_cost(
         scorers.disappearance_model,
         (
             node.end_stats.intensity_std,
             node.end_stats.border_distance,
             node.end_stats.area,
         ),
+    )
+    return base_cost + config.consensus_short_interior_penalty * short_fragment_boundary_penalty(
+        node,
+        total_frame_count,
+        config.consensus_short_fragment_max_length,
     )
 
 
@@ -3602,23 +4489,6 @@ def dominant_source(node: TrackletNode) -> str:
         return node.source_name
     assert node.source_names is not None
     return "+".join(node.source_names)
-
-
-def boundary_overlap_details(
-    parent: TrackletNode,
-    child: TrackletNode,
-    frame_index: int,
-    indexed_solutions: dict[str, SolutionIndex],
-) -> tuple[int, float]:
-    parent_coords = node_variant_coords("union", parent, frame_index, indexed_solutions)
-    child_coords = node_variant_coords("union", child, frame_index, indexed_solutions)
-    if parent_coords.size == 0 or child_coords.size == 0:
-        return 0, 0.0
-    overlap = intersect_coords(parent_coords, child_coords)
-    if overlap.size == 0:
-        return 0, 0.0
-    smaller = min(len(parent_coords), len(child_coords))
-    return int(len(overlap)), float(len(overlap) / max(1, smaller))
 
 
 def node_variant_coords(

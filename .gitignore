@@ -137,3 +137,6 @@ licensetools9.5.1_linux64/
 test-data/
 models/
 outputs/
+*.png
+*.pdf
+*.tex

@@ -26,10 +26,13 @@ class TrackingConfig:
     force_retrack: bool = False
     segmentation_reward: float = -105.0
     train_iou_threshold: float = 0.3
-    common_geometry_mode: str = "posthoc"
+    common_geometry_mode: str = "joint"
     geometry_source_weight: float = 1.0
     geometry_temporal_overlap_weight: float = 0.25
     geometry_neighbor_radius: int = 5
+    consensus_division_persistence_reward: float = 5.0
+    consensus_short_interior_penalty: float = 4.0
+    consensus_short_fragment_max_length: int = 2
 
 
 @dataclass(slots=True, frozen=True)
